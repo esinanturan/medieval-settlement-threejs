@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { NodeMaterial } from 'three/webgpu';
 import { loadBitmapTexture } from '../utils/textureLoad.ts';
 import { supportsNodeMaterials, type RendererBackendKind } from '../scene/RendererBackend.ts';
 import {
@@ -332,10 +333,7 @@ export class SkyCloudMesh extends THREE.Group {
     this.starBackdrop = starBackdrop ?? null;
     this.eanpa = system;
     for (const [index, dome] of system.domes.entries()) {
-      // Three's bundled NodeMaterial declarations omit its vertexNode hook.
-      (dome as THREE.Mesh<THREE.BufferGeometry, THREE.Material & {
-        vertexNode: typeof skyDomeVertex;
-      }>).material.vertexNode = skyDomeVertex;
+      (dome as THREE.Mesh<THREE.BufferGeometry, NodeMaterial>).material.vertexNode = skyDomeVertex;
       dome.name = index === 0
         ? 'Eanpa atmospheric and historical celestial dome'
         : 'Eanpa volumetric cloud dome';

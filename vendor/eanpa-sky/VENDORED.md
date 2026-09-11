@@ -69,12 +69,33 @@ precipitation visuals passed. Seven browser captures reported no GPU errors;
 the paused frame was pixel-identical, guide visibility changed 6,311 pixels,
 and seasonal rotation changed 175,188 pixels.
 
-Two broader checks already fail at game commit
-`adebb282df90627f3ec63c8e89f076cf1cf14fe9`:
-`test:celestial-sky` rejects the medium-world extent against the existing sky
-radius, and `test:startup-chunking` expects an older startup compilation source
-pattern. Both failures were reproduced using the original committed source.
-The remaining celestial assertions passed in a scratch copy with only that
-world-extent assertion omitted; the committed tests and world settings were
-not changed. Local comparison evidence is in `artifacts/eanpa-update/` and
-`artifacts/eanpa-sky/` (ignored by Git).
+The two pre-existing failures at game commit
+`adebb282df90627f3ec63c8e89f076cf1cf14fe9` were fixed in the follow-up:
+
+- The application projects sky/cloud dome vertices to far depth, keeping them
+  behind the entire terrain horizon and preventing altitude-dependent clipping.
+  This is an application hook in `src/sky/skyDomeDepth.ts`; the vendor patch is
+  unchanged. The legacy fallback uses the equivalent clip-space depth.
+- Camera far distance now follows the full three-dimensional live orbit and
+  map dimensions: 2,600 / 2,824 / 3,819 metres for small / medium / large maps.
+  The camera controller and visibility bounds share the actual outer zoom stop.
+- The startup test executes the production warmup methods, checking texture
+  upload, one scene compile in the live pass state, asynchronous completion,
+  hidden-object preservation, and cleanup on failure.
+- The suite also exposed an August bundle-size ceiling already exceeded by
+  the original revision. Its source was rebuilt with the installed toolchain:
+  entry 1,270,751 bytes / 371,768 gzip; static closure 3,665,550 / 1,053,526 gzip.
+  The current baseline allows 1% growth for each metric. Reproduce it with
+  `node scripts/measureStartupBundle.mjs --ref=adebb282df90627f3ec63c8e89f076cf1cf14fe9`.
+
+Both `test:celestial-sky` and `test:startup-chunking` now pass, as do camera
+controls, startup loading, terrain horizon, Eanpa integration and production
+build checks. `test:sky-depth-browser` isolates depth with an opaque cyan sky
+and a magenta receiver near the far plane, across all three map sizes, three
+heights and three pitches. All 54 views across native WebGPU and legacy WebGL
+passed with zero receiver overwrites or sky holes. Select the legacy fallback
+with `SKY_DEPTH_BACKEND=webgl`. Normal sky appearance and the historical
+catalogue remain covered separately by `test:eanpa-sky-browser`.
+
+Local comparison evidence is in `artifacts/eanpa-update/`,
+`artifacts/eanpa-sky/`, and `artifacts/sky-depth-*` (ignored by Git).

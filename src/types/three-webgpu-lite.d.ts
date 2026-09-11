@@ -71,6 +71,7 @@ declare module 'three/webgpu' {
   }
 
   export class NodeMaterial extends THREE.Material {
+    vertexNode: unknown;
     fragmentNode: unknown;
     colorNode: unknown;
     normalNode: unknown;

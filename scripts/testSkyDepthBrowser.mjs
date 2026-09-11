@@ -5,7 +5,9 @@ import { createServer } from 'vite';
 
 // Isolate depth from stochastic cloud density: opaque cyan clouds must never
 // cover the magenta receiver, even beyond the physical sky mesh's radius.
-const out = process.env.SKY_DEPTH_OUTPUT ?? 'artifacts/sky-depth';
+const requestedBackend = process.env.SKY_DEPTH_BACKEND ?? 'webgpu';
+assert.ok(['webgpu', 'webgl'].includes(requestedBackend));
+const out = process.env.SKY_DEPTH_OUTPUT ?? `artifacts/sky-depth-${requestedBackend}`;
 mkdirSync(out, { recursive: true });
 const server = await createServer({ server: { host: '127.0.0.1', port: 0, hmr: false } });
 await server.listen();
@@ -20,29 +22,41 @@ try {
   });
   await page.route('**/sky-depth-probe', route => route.fulfill({ contentType: 'text/html', body: '<body></body>' }));
   await page.goto(new URL('sky-depth-probe', server.resolvedUrls.local[0]).href);
-  const result = await page.evaluate(async () => {
-    const { THREE, TSL } = await import('/scripts/fixtures/webgpuTestImports.ts');
+  const result = await page.evaluate(async (requestedBackend) => {
+    const { THREE, TSL, WebGLRenderer, WebGLRenderTarget } = await import('/scripts/fixtures/webgpuTestImports.ts');
     const { createPreferredRenderer } = await import('/src/scene/RendererBackend.ts');
     const { SkyCloudMesh } = await import('/src/sky/SkyCloudMesh.ts');
     const { MAP_SIZE_PRESETS } = await import('/src/world/worldGenerationSettings.ts');
     const { LIVE_WORLD_MAX_DISTANCE } = await import('/src/camera/CameraCurves.ts');
     const { computeWorldCameraFarPlane } = await import('/src/sky/skyDepthOcclusionPolicy.ts');
-    const backend = await createPreferredRenderer(), renderer = backend.renderer;
+    const backend = requestedBackend === 'webgl'
+      ? { kind: 'webgl', renderer: new WebGLRenderer({ antialias: true }), adapterEvidence: null }
+      : await createPreferredRenderer();
+    const renderer = backend.renderer;
     renderer.setSize(640, 400); renderer.setPixelRatio(1); renderer.toneMapping = THREE.NoToneMapping;
-    const target = new THREE.RenderTarget(640, 400);
+    const target = requestedBackend === 'webgl' ? new WebGLRenderTarget(640, 400) : new THREE.RenderTarget(640, 400);
     const scene = new THREE.Scene(); scene.background = new THREE.Color(0);
     const sky = new SkyCloudMesh({ rendererBackend: backend.kind });
     scene.add(sky); await sky.ready;
     for (const dome of sky.children) {
-      dome.material.fragmentNode = TSL.vec4(0, 1, 1, 1);
+      if (requestedBackend === 'webgl') dome.material.fragmentShader = 'void main() { gl_FragColor = vec4(0.0, 1.0, 1.0, 1.0); }';
+      else dome.material.fragmentNode = TSL.vec4(0, 1, 1, 1);
       dome.material.needsUpdate = true;
     }
     const camera = new THREE.PerspectiveCamera(60, 1.6, .1, 2600);
-    const receiver = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicNodeMaterial({ color: 0xff00ff }));
+    const material = requestedBackend === 'webgl'
+      ? new THREE.MeshBasicMaterial({ color: 0xff00ff })
+      : new THREE.MeshBasicNodeMaterial({ color: 0xff00ff });
+    const receiver = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), material);
     scene.add(receiver);
     const rows = [], images = [];
     async function pixels() {
       renderer.setRenderTarget(target); renderer.render(scene, camera);
+      if (requestedBackend === 'webgl') {
+        const data = new Uint8Array(640 * 400 * 4);
+        renderer.readRenderTargetPixels(target, 0, 0, 640, 400, data);
+        return data;
+      }
       return new Uint8Array(await renderer.readRenderTargetPixelsAsync(target, 0, 0, 640, 400));
     }
     function save(name, bytes) {
@@ -86,7 +100,7 @@ try {
     }
     sky.dispose(); receiver.geometry.dispose(); receiver.material.dispose(); target.dispose(); renderer.dispose();
     return { rows, images, adapter: backend.adapterEvidence };
-  });
+  }, requestedBackend);
   for (const image of result.images) writeFileSync(`${out}/${image.name}.png`, Buffer.from(image.data.split(',')[1], 'base64'));
   delete result.images;
   writeFileSync(`${out}/regression.json`, JSON.stringify({ result, errors }, null, 2));
@@ -97,7 +111,7 @@ try {
     assert.equal(row.overwritten, 0, `${name}: sky/clouds must stay behind distant geometry`);
     assert.equal(row.holes, 0, `${name}: sky must cover the viewport without far-plane clipping`);
   }
-  console.log(`Sky depth passed: ${result.rows.length} map/height/pitch views; no occlusion errors or sky holes.`);
+  console.log(`Sky depth (${requestedBackend}) passed: ${result.rows.length} map/height/pitch views; no occlusion errors or sky holes.`);
 } finally {
   await browser?.close(); await server.close();
 }
