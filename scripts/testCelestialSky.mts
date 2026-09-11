@@ -18,9 +18,10 @@ import {
 import { computeSiderealAngle } from '../src/world/dayNightPresentation.ts';
 import {
   maximumOpaqueWorldDistanceFromCamera,
-  SKY_DEPTH_OCCLUSION_RADIUS,
-  SKY_OPAQUE_LAST_RENDER_ORDER,
+  computeWorldCameraFarPlane,
+  WORLD_OPAQUE_VERTICAL_ENVELOPE,
 } from '../src/sky/skyDepthOcclusionPolicy.ts';
+import { LIVE_WORLD_MAX_DISTANCE } from '../src/camera/CameraCurves.ts';
 import {
   GORSKI_KOTAR_1550_TO_J2000_PRECESSION,
   GORSKI_KOTAR_CELESTIAL_EPOCH,
@@ -29,19 +30,38 @@ import {
 } from '../src/sky/gorskiKotarCelestial.ts';
 import { MAP_SIZE_PRESETS } from '../src/world/worldGenerationSettings.ts';
 
-const maxOrbitDistance = 88 / 0.3;
 for (const dimensions of Object.values(MAP_SIZE_PRESETS)) {
+  const bounds = {
+    terrainSize: dimensions.terrainSize,
+    playableSize: dimensions.playableSize,
+    maxOrbitDistance: LIVE_WORLD_MAX_DISTANCE,
+  };
+  const reach = maximumOpaqueWorldDistanceFromCamera(bounds);
+  const far = computeWorldCameraFarPlane(bounds);
   assert.ok(
-    maximumOpaqueWorldDistanceFromCamera({
-      terrainSize: dimensions.terrainSize,
-      playableSize: dimensions.playableSize,
-      maxOrbitDistance,
-    }) < SKY_DEPTH_OCCLUSION_RADIUS,
-    `${dimensions.label} world opaques must remain in front of the depth-occluded sky`,
+    reach < far,
+    `${dimensions.label} world must fit inside the camera's far plane`,
   );
+  // Exercise opposite-edge pans, the real outer zoom stop, both pitch limits,
+  // and the complete terrain/structure vertical envelope. The orbit is a 3D
+  // offset from the target; adding it only to horizontal reach underestimates
+  // diagonal views over elevated terrain.
+  for (const targetY of [0, WORLD_OPAQUE_VERTICAL_ENVELOPE]) {
+    for (const pointY of [0, WORLD_OPAQUE_VERTICAL_ENVELOPE]) {
+      for (const pitch of [5, 70]) {
+        for (let yaw = 0; yaw < 360; yaw += 45) {
+          const camera = new THREE.Vector3().setFromSphericalCoords(
+            LIVE_WORLD_MAX_DISTANCE,
+            THREE.MathUtils.degToRad(90 - pitch),
+            THREE.MathUtils.degToRad(yaw),
+          ).add(new THREE.Vector3(dimensions.playableHalf, targetY, dimensions.playableHalf));
+          const point = new THREE.Vector3(-dimensions.terrainSize / 2, pointY, -dimensions.terrainSize / 2);
+          assert.ok(camera.distanceTo(point) <= reach, `${dimensions.label}: world bounds include the complete orbit`);
+        }
+      }
+    }
+  }
 }
-assert.ok(SKY_OPAQUE_LAST_RENDER_ORDER > 0,
-  'the depth-occluded sky must sort after ordinary opaque world geometry');
 
 const eanpaSource = fs.readFileSync('vendor/eanpa-sky/engine/sky_system.js', 'utf8');
 const eanpaLicense = fs.readFileSync('vendor/eanpa-sky/LICENSE', 'utf8');

@@ -50,6 +50,10 @@ export const LIVE_WORLD_OVERVIEW_ZOOM_PERCENT = 30;
 export const LIVE_WORLD_MIN_ZOOM_PERCENT = LIVE_WORLD_OVERVIEW_ZOOM_PERCENT
   / CAMERA_ZOOM_STEP_MULTIPLIER;
 
+/** Shared by camera controls and the world visibility envelope. */
+export const LIVE_WORLD_MAX_DISTANCE = BASELINE_ORBIT_DISTANCE
+  / (LIVE_WORLD_MIN_ZOOM_PERCENT / 100);
+
 /**
  * Keep the physical paper and its table surround legible during map-only
  * orbiting. The live world deliberately retains its much lower 5-degree

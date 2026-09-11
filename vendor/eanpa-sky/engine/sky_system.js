@@ -1,7 +1,7 @@
 // sky_system.js — WORLD-SPACE volumetric sky for eidoverse.
 //
 // Vendored by medieval-road-system as an ES module. The rendering code remains
-// Eanpa Sky v0.1; the small integration patch below supplies the game's
+// Eanpa Sky v0.2.1; the small integration patch below supplies the game's
 // historical latitude/sidereal star orientation and constellation overlay.
 
 import * as THREE_WEBGPU from 'three/webgpu';
@@ -28,6 +28,10 @@ import * as TSL from 'three/tsl';
 //   sky.setClouds('cumulus');     // cumulus | stratus | cirrus | clear
 //   sky.applyToLights({ sun, hemi, fog: scene.fog });
 //   // per frame: sky.update(t, camera)
+import { makeCloudShadowMap } from './cloud_shadow_map.js';
+import { createCloudMotion } from './cloud_motion.js';
+import { makeAnalyticSkyNoise } from './sky_noise.js';
+
     const T3 = { ...THREE_WEBGPU, ...TSL };
     const {
         uniform, Fn, vec2, vec3, vec4, float, Loop, Break, If,
@@ -153,17 +157,14 @@ import * as TSL from 'three/tsl';
         // the field reads as cloud smeared along that plane — the darkstorm band,
         // whose upper edge is exactly the elevation of the deck base at the
         // flat/curve join (atan(450/4200) = 6.1 deg, measured at y=345).
-        // STORMSTEPS overrides; the loop bound has to be a build-time constant.
+        // opts.stormSamples overrides; the loop bound has to be a build-time constant.
         const N_STORM_STEPS = Math.max(4, Math.round(Number(
-            globalThis.Deno?.env?.get?.('STORMSTEPS') ?? opts.stormSamples ?? 12)));
+            opts.stormSamples ?? 12)));
         const N_STORM_PASSES = 2;
-        // Cloud shadows are a sky-budget item, but 2-6 taps integrated a
-        // fine erosion-bearing density so coarsely that a drifting cloud
-        // edge SNAPPED whole flat surfaces between shaded and unshaded.
-        // A 12-tap floor keeps the travelling patches while their edges
-        // sweep smoothly; each tap is one cheapDensity fbm evaluation.
-        const N_CLOUD_SHADOW = Math.max(12, Math.min(16,
-            Math.round(opts.cloudShadowSamples ?? (N_MARCH / 3))));
+        // Integrate the visible density once into the shared ground shadow
+        // field. A dynamic loop can terminate an already opaque column early.
+        const N_CLOUD_SHADOW = Math.max(32, Math.min(64,
+            Math.round(opts.cloudShadowSamples ?? N_MARCH)));
         // The old animated interleaved-gradient output dither becomes visible
         // as diagonal line grain after the optimized pass is downsampled and
         // enlarged. These domes render in HDR (including the offscreen cloud
@@ -183,6 +184,8 @@ import * as TSL from 'three/tsl';
             horizon: uniform(V(0.62, 0.78, 0.92)),
             sunColor: uniform(V(1, 0.95, 0.9)),
             sunDiscI: uniform(48),
+            solarVisibility: uniform(1),
+            solarSkyVisibility: uniform(1),
             sunGlowI: uniform(1),      // forward-scatter glow lobes gate — scenes with a custom celestial body AS the sun zero this (the disc obeys sunDiscI; these lobes previously bled a bright white core through any body riding sunDir)
             frameJit: uniform(0),      // EANPA: per-frame golden-ratio phase for temporal blue-noise jitter (fed by the cloud frame graph)
             starFade: uniform(0),
@@ -214,6 +217,7 @@ import * as TSL from 'three/tsl';
             cloudTint: uniform(V(1, 1, 1)),
             cloudDim: uniform(1),      // weather-system hook for rain, shafts, and Ringworld reflection response
             cloudRadiance: uniform(1), // cloud-form readability; severe weather may lift this without brightening rain/shafts/ring
+            cloudWeatherGrey: uniform(0),
             // WORLD-level cloud exposure, multiplied on top of cloudRadiance.
             // The weather system owns cloudRadiance (it rewrites it per state),
             // so a scene that needs a permanent exposure offset — an alien
@@ -247,6 +251,7 @@ import * as TSL from 'three/tsl';
             shaftDen: uniform(opts.shaftDensity ?? 3e-5),
             precipK: uniform(0),   // world rain: curtain density under dense weather cells (weather-system hook)
             precipLo: uniform(0.95), precipHi: uniform(1.55),
+            cloudDisplacement: uniform(V(0, 0, 0)),
             skyWind: uniform(V(0, 0, 10.3)), // ONE wind drives cloud drift, weather-cell motion, and (via weather system) rain shear
             wallCloud: uniform(new T3.Vector4(0, 0, 1, 0)), // (x, z, radius, strength): local cloud-base LOWERING (tornado wall cloud)
             fadeDist: uniform(opts.cloudFadeDist ?? 26000),
@@ -254,6 +259,11 @@ import * as TSL from 'three/tsl';
             projInv: uniform(new T3.Matrix4()),
             camWorld: uniform(new T3.Matrix4()),
         };
+        // Shared atmospheric state is identical for every material in a frame.
+        // Camera matrices remain render-scoped because sky captures change view.
+        if (T3.frameGroup) for (const [name, node] of Object.entries(u)) {
+            if (name !== 'projInv' && name !== 'camWorld') node.setGroup(T3.frameGroup);
+        }
 
         // ---------------- shared noise (donor pattern: data-texture value noise) ----------------
         const NSZ = 256;
@@ -322,6 +332,23 @@ import * as TSL from 'three/tsl';
         weatherTex.needsUpdate = true;
         const weatherNode = T3.texture(weatherTex);
 
+        // A periodic optical-depth atlas of sheared ice trails. Hosts may
+        // supply their own linear coverage texture; the built-in asset is
+        // owned and released with this sky. One mip-filtered read replaces
+        // many analytic plumes in both the visible layer and shadow field.
+        const ownsCirrusTexture = !textures.cirrus;
+        const cirrusTex = textures.cirrus ?? await new T3.TextureLoader().loadAsync(
+            new URL('../assets/weather/cirrus_ice_trails.png', import.meta.url).href,
+        );
+        if (ownsCirrusTexture) {
+            cirrusTex.name = 'eanpa_cirrus_ice_trails';
+            cirrusTex.colorSpace = T3.NoColorSpace;
+            cirrusTex.wrapS = cirrusTex.wrapT = T3.RepeatWrapping;
+            cirrusTex.minFilter = T3.LinearMipmapLinearFilter;
+            cirrusTex.magFilter = T3.LinearFilter;
+        }
+        const cirrusNode = T3.texture(cirrusTex);
+
         const m0 = vec3(0.0, 0.8, 0.6), m1 = vec3(-0.8, 0.36, -0.48), m2 = vec3(-0.6, -0.48, 0.64);
         const applyM = (p) => vec3(dot(p, m0), dot(p, m1), dot(p, m2));
         const fbm3 = (p) => {
@@ -353,28 +380,7 @@ import * as TSL from 'three/tsl';
         // reaches ±250 lattice units and GPU sin() argument reduction breaks down
         // there, banding fract(sin(big)*43758) into straight-edged plates (bisect-
         // verified with wispOn=0). Bounded products only.
-        const hash3 = (pIn) => {
-            const q = fract(pIn.mul(0.3183099).add(vec3(0.1, 0.17, 0.13))).mul(17);
-            return fract(q.x.mul(q.y).mul(q.z).mul(q.x.add(q.y).add(q.z)));
-        };
-        const noise3A = (p) => {
-            const i = floor(p), f = fract(p);
-            const sm = f.mul(f).mul(float(3).sub(f.mul(2)));
-            const nx0 = mix(hash3(i), hash3(i.add(vec3(1, 0, 0))), sm.x);
-            const nx1 = mix(hash3(i.add(vec3(0, 1, 0))), hash3(i.add(vec3(1, 1, 0))), sm.x);
-            const nx2 = mix(hash3(i.add(vec3(0, 0, 1))), hash3(i.add(vec3(1, 0, 1))), sm.x);
-            const nx3 = mix(hash3(i.add(vec3(0, 1, 1))), hash3(i.add(vec3(1, 1, 1))), sm.x);
-            return mix(mix(nx0, nx1, sm.y), mix(nx2, nx3, sm.y), sm.z);
-        };
-        const fbm3A = (p) => {
-            const pp = p.toVar();
-            const f = noise3A(pp).mul(0.5).toVar();
-            pp.assign(applyM(pp).mul(2.02));
-            f.addAssign(noise3A(pp).mul(0.25));
-            pp.assign(applyM(pp).mul(2.03));
-            f.addAssign(noise3A(pp).mul(0.125));
-            return f;
-        };
+        const {noise3A, fbm3A} = makeAnalyticSkyNoise(T3);
         // Optional optimized-tier 3D density BASIS. This caches the random
         // lattice used by the erosion FBM, not the animated cloudsAt result:
         // weather, height, wind, both erosion stages, and all FBM octaves stay
@@ -460,13 +466,13 @@ import * as TSL from 'three/tsl';
         // left the streaks — they're density structure). Shearing the
         // lookup by in-layer height, gated by |slope|, breaks the climb
         // into stacked cells and is an exact no-op wherever the deck is flat.
-        // RINGSHEAR scales the coefficient for bisecting the vertically
+        // opts.ringShear scales the coefficient for bisecting the vertically
         // stretched "wall" of cloud reported at the horizon on darkstorm.
         // darkstorm authors its own layer geometry (start 500 / height 650 vs
         // the cumulus default 700 / 520), so a coefficient tuned against the
         // default may not break its climb into cells.
         const RING_SHEAR_K = Number(
-            globalThis.Deno?.env?.get?.('RINGSHEAR') ?? 2.0);
+            opts.ringShear ?? 2.0);
         const ringZShear = (pIn, ch) => RING_R
             ? ringSlopeAt(pIn).mul(ch).mul(RING_THICK * RING_SHEAR_K)
             : float(0);
@@ -475,9 +481,9 @@ import * as TSL from 'three/tsl';
             const atmoH = atmoHeight(pIn);
             const ch = atmoH.sub(u.cloudStart.sub(wallLower(pIn).mul(260))).div(u.cloudHeight).clamp(0, 1);
             const zW = ringZShear(pIn, ch);
-            const p1 = p.add(vec3(u.skyWind.x.mul(u.time), 0, u.skyWind.z.mul(u.time)));
+            const p1 = p.add(vec3(u.cloudDisplacement.x.negate(), 0, u.cloudDisplacement.z.negate()));
             const largeWeather = clamp(wSampleL(vec2(p1.z.add(zW), p1.x).mul(float(-0.00005).mul(u.wScale))).sub(u.largeT).mul(u.largeA), 0, 2);
-            const p2 = p1.add(vec3(u.skyWind.z.mul(u.time).mul(0.4), 0, u.skyWind.x.mul(u.time).mul(-0.4)));
+            const p2 = p1.add(vec3(u.cloudDisplacement.z.negate().mul(0.4), 0, u.cloudDisplacement.x.negate().mul(-0.4)));
             const weather2 = max(wSampleS(vec2(p2.z.add(zW), p2.x).mul(float(0.00005).mul(u.wScale)).add(vec2(0.37, 0.11))).sub(u.weatherT), 0).div(0.72);
             const weather = largeWeather.mul(weather2)
                 .mul(smoothstep(0.0, 0.5, ch))
@@ -498,9 +504,9 @@ import * as TSL from 'three/tsl';
             const atmoH = atmoHeight(pIn);
             const ch = atmoH.sub(u.cloudStart).div(u.cloudHeight).clamp(0, 1);
             const zW = ringZShear(pIn, ch);
-            const p1 = p.add(vec3(u.skyWind.x.mul(u.time), 0, u.skyWind.z.mul(u.time)));
+            const p1 = p.add(vec3(u.cloudDisplacement.x.negate(), 0, u.cloudDisplacement.z.negate()));
             const lw = clamp(wSampleL(vec2(p1.z.add(zW), p1.x).mul(float(-0.00005).mul(u.wScale))).sub(u.largeT).mul(u.largeA), 0, 2);
-            const p2 = p1.add(vec3(u.skyWind.z.mul(u.time).mul(0.4), 0, u.skyWind.x.mul(u.time).mul(-0.4)));
+            const p2 = p1.add(vec3(u.cloudDisplacement.z.negate().mul(0.4), 0, u.cloudDisplacement.x.negate().mul(-0.4)));
             const w2 = max(wSampleS(vec2(p2.z.add(zW), p2.x).mul(float(0.00005).mul(u.wScale)).add(vec2(0.37, 0.11))).sub(u.weatherT), 0).div(0.72);
             const weather = lw.mul(w2)
                 .mul(smoothstep(0.0, 0.5, ch))
@@ -520,9 +526,9 @@ import * as TSL from 'three/tsl';
             const p = pIn.mul(u.stretch);
             const ch = atmoHeight(pIn).sub(u.cloudStart.sub(wallLower(pIn).mul(260))).div(u.cloudHeight).clamp(0, 1);
             const zW = ringZShear(pIn, ch);
-            const p1 = p.add(vec3(u.skyWind.x.mul(u.time), 0, u.skyWind.z.mul(u.time)));
+            const p1 = p.add(vec3(u.cloudDisplacement.x.negate(), 0, u.cloudDisplacement.z.negate()));
             const lw = clamp(wSampleL(vec2(p1.z.add(zW), p1.x).mul(float(-0.00005).mul(u.wScale))).sub(u.largeT).mul(u.largeA), 0, 2);
-            const p2 = p1.add(vec3(u.skyWind.z.mul(u.time).mul(0.4), 0, u.skyWind.x.mul(u.time).mul(-0.4)));
+            const p2 = p1.add(vec3(u.cloudDisplacement.z.negate().mul(0.4), 0, u.cloudDisplacement.x.negate().mul(-0.4)));
             const w2 = max(wSampleS(vec2(p2.z.add(zW), p2.x).mul(float(0.00005).mul(u.wScale)).add(vec2(0.37, 0.11))).sub(u.weatherT), 0).div(0.72);
             const weather = lw.mul(w2)
                 .mul(smoothstep(0.0, 0.5, ch))
@@ -858,9 +864,9 @@ import * as TSL from 'three/tsl';
             );
 
             const drift = pIn.add(vec3(
-                u.skyWind.x.mul(u.time).mul(0.62),
+                u.cloudDisplacement.x.negate().mul(0.62),
                 u.time.mul(1.15),
-                u.skyWind.z.mul(u.time).mul(0.62),
+                u.cloudDisplacement.z.negate().mul(0.62),
             ));
             const warp = noise3A(
                 applyM(drift.mul(0.00031)).add(vec3(1.7, -3.1, 4.6)),
@@ -1051,7 +1057,7 @@ import * as TSL from 'three/tsl';
                 // CPU emulation of the full weather+erosion chain: max err
                 // 0.0097 = f16 rounding, corr 1.0000), but the FRAGMENT stage's
                 // reads of the same Data3DTexture drift over the run on the
-                // Deno-wgpu backend (differential probes: pristine at t=2.5 s,
+                // legacy wgpu backend (differential probes: pristine at t=2.5 s,
                 // straight-edged corrupt regions growing from t≈4 s — same
                 // object identity, compute readback still pristine at t=18 s).
                 // A cache built from the TRUE basis therefore lights a field
@@ -1074,13 +1080,82 @@ import * as TSL from 'three/tsl';
         // ---------------- CLOUD DOME material ----------------
         // body parameterized on (dir, org) so the env bake below can evaluate
         // the SAME sky from equirect directions (dome pass uses screen rays)
-        // CLOUDDBG=1: lookdev build that strips every under-the-deck camera
+        // opts.cloudDebug=true: lookdev build that strips every under-the-deck camera
         // assumption — no upward-ray gate, march from the camera over the
         // full range, no distance/horizon fades. Coarse (N_MARCH over the
         // whole fadeDist) but it SHOWS THE SHAPE from any vantage, which is
         // the entire point of a debug view — never cull the subject of a
         // debug. Proper any-vantage rendering is future work.
-        const CLOUD_DBG = globalThis.Deno?.env?.get?.('CLOUDDBG') === '1';
+        const CLOUD_DBG = opts.cloudDebug === true;
+        // One high-cloud field drives both visible coverage and celestial
+        // transmittance. A shadow never invents a second, unrelated noise map.
+        const highCloudAlphaAt = Fn(([pC]) => {
+            // Broad sheets retain the filtered, domain-warped 3D field.
+            // Cirrus below samples the separate mipmapped ice-trail atlas.
+            // Both advect with the common world-space wind and supply the
+            // same opacity field to visibility and celestial shadows.
+            const wispAdvected = pC.add(vec3(
+                u.cloudDisplacement.x.negate(), 0, u.cloudDisplacement.z.negate(),
+            ));
+            const wispPatch = fbmE(wispAdvected.mul(0.00016).add(vec3(4.7, 1.3, -2.1)));
+            const wispWarp = fbmE(wispAdvected.mul(0.00031).add(vec3(-1.7, 3.1, 5.3))).sub(0.44);
+            const wispBend = fbmE(wispAdvected.mul(0.00009).add(vec3(8.2, -1.4, 2.7))).sub(0.44);
+            const wispP = wispAdvected.mul(u.wispStretch).mul(u.wispScale)
+                .add(vec3(
+                    wispWarp.mul(1.8).add(wispBend.mul(1.4)),
+                    wispWarp.mul(0.35),
+                    wispWarp.mul(-1.2).add(wispBend.mul(0.7)),
+                ));
+            const wispN = fbmE(wispP);
+            const authoredSheet = smoothstep(u.wispThreshold, u.wispThreshold.add(0.24), wispN)
+                .mul(smoothstep(0.30, 0.62, wispPatch));
+            const sheet = authoredSheet;
+            // The atlas records irregular emitter families and their curved
+            // fall trails. Advect and orient the entire field with the wind;
+            // its phase is shared by sky radiance and cloud transmittance.
+            const shear=normalize(u.skyWind.xz.add(vec2(.001)));
+            const along=dot(wispAdvected.xz,shear),across=dot(wispAdvected.xz,vec2(shear.y.negate(),shear.x));
+            const fibers=cirrusNode.sample(vec2(along,across).div(18000).add(vec2(.24,.47))).r.mul(.82);
+            // Do not execute the cirrus plume graph for ordinary cumulus,
+            // stratus, Ringworld, or storm sheets. A narrow transition band
+            // still crossfades both fields when weather morphs to/from High
+            // Cirrus, so there is no hard visual swap. This restores the
+            // optimized tiers' budget without removing either cloud element.
+            const wispShape = float(0).toVar();
+            If(u.wispFilament.lessThan(0.55), () => {
+                wispShape.assign(sheet);
+            }).Else(() => {
+                If(u.wispFilament.greaterThan(0.85), () => {
+                    wispShape.assign(fibers);
+                }).Else(() => {
+                    wispShape.assign(mix(sheet, fibers, smoothstep(0.55, 0.85, u.wispFilament)));
+                });
+            });
+            // Severe weather needs broad coverage, not a constant-opacity card.
+            // Treat wispFloor as the strength of a second low-frequency organic
+            // canopy so Dark Storm keeps holes, folds, and soft boundaries.
+            const canopyField = smoothstep(
+                0.18, 0.56,
+                wispPatch.mul(0.72).add(wispBend.add(0.44).mul(0.28)),
+            );
+            // Keep broad severe-weather coverage while preserving internal
+            // cloud structure.  Multiplying the low-frequency canopy by the
+            // already-filtered authored noise prevents its dense interiors
+            // from reading as one flat grey card overhead.
+            const canopyDetail = smoothstep(0.20, 0.82, wispN).mul(0.45).add(0.55);
+            const canopyShape = max(wispShape, canopyField.mul(u.wispFloor).mul(canopyDetail));
+            return min(canopyShape.mul(u.wispOn).mul(u.wispStrength).mul(u.wispOpacity), 0.88);
+        });
+        const highCloudHit = Fn(([org, dir]) => {
+            const flatY = u.cloudStart.add(u.cloudHeight).add(1000);
+            // Upper sheets share a continuous atmospheric cap for every
+            // preset. The former finite low-deck intersection exposed its
+            // rectangular end in cumulus accents and weather transitions too.
+            // The separate low volume and distant ring atlas remain confined
+            // to the ring; distance extinction feathers this upper layer.
+            return vec2(shellFar(org,dir,flatY),1);
+        });
+
         const cloudBody = (
             dirIn, orgIn, passesIn, jitterOverride = null,
             transientLightScale = float(1),
@@ -1173,8 +1248,13 @@ import * as TSL from 'three/tsl';
                         const s = cloudsAt(p);
                         If(s.density.greaterThan(0.0), () => {
                             const intensity = lightRay(p, phaseF, s.density, mu, s.ch, fract(fract(baseJit.mul(73.1063)).add(k * 0.6180339887)));
-                            const amb = u.cloudAmbSky.mul(float(0.5).add(s.ch.mul(0.6)))
+                            const clearAmb = u.cloudAmbSky.mul(float(0.5).add(s.ch.mul(0.6)))
                                 .add(u.cloudAmbGround.mul(max(float(1).sub(s.ch.mul(2)), 0)));
+                            // A closed wet deck receives diffuse multiple
+                            // scattering, rather than the clear blue fill.
+                            // Keep the active star/moon spectrum on alien skies.
+                            const keyChroma=u.cloudLightColor.div(max(max(u.cloudLightColor.x,u.cloudLightColor.y),u.cloudLightColor.z).max(.0001));
+                            const amb=mix(clearAmb,vec3(dot(clearAmb,vec3(.2126,.7152,.0722))).mul(keyChroma),u.cloudWeatherGrey);
                             // A sealed cumulonimbus canopy removes direct sun
                             // from everything beneath it. The underlayer keeps
                             // its shape readable via a dim top-weighted canopy
@@ -1221,169 +1301,19 @@ import * as TSL from 'three/tsl';
             // cloud ceiling seen between the low volumetric masses. The gate
             // still skips all of its work whenever wispOn is zero.
             If(u.wispOn.greaterThan(0.0001), () => {
-            // High clouds share the live cloud material and weather uniforms.
-            // Earth/Shieldworld intersect the preset's upper spherical shell.
-            // Ringworld keeps that SAME semantic altitude and SAME cloud field,
-            // adding only the authored deck displacement at the curved ends.
-            // The former fixed 1550 m surface compressed Cirrus from 4630 m and
-            // clipped most of the shared upper layer out of the visible sky.
-            const ringWispFlatY = u.cloudStart.add(u.cloudHeight).add(1000);
-            const ringWispYAt = (zq) => ringDeckY(zq).sub(RING_BASE).add(ringWispFlatY);
-            const ringWispDy = max(dir.y, 0.008);
-            // The ray's flat-height hit and maximum-rise hit bracket every
-            // possible intersection with this bounded circular profile.
-            // Bisection stays stable at the near-tangent curved ends where the
-            // former two fixed-point guesses could float tens of metres off
-            // the authored surface or fabricate a shelf hit.
-            const ringWispTLo = ringWispFlatY.sub(org.y).div(ringWispDy).toVar();
-            const ringWispTHi = ringWispFlatY.add(RING_RISE).sub(org.y).div(ringWispDy).toVar();
-            for (let solveStep = 0; solveStep < 8; solveStep++) {
-                const ringWispTMid = ringWispTLo.add(ringWispTHi).mul(0.5);
-                const ringWispPMid = org.add(dir.mul(ringWispTMid));
-                If(org.y.add(ringWispDy.mul(ringWispTMid)).lessThan(ringWispYAt(ringWispPMid.z)), () => {
-                    ringWispTLo.assign(ringWispTMid);
-                }).Else(() => {
-                    ringWispTHi.assign(ringWispTMid);
-                });
-            }
-            const ringWispT = ringWispTLo.add(ringWispTHi).mul(0.5);
-            const wispHitT = RING_R ? ringWispT : shellFar(org, dir, sTop.add(1000));
-            const pC = org.add(dir.mul(wispHitT));
-            // Preserve the full open-side footprint across the complete flat
-            // middle, then contract only after the authored curve begins.
-            const ringWispProgress = smoothstep(
-                float(RING_ZFLAT), float(RING_VISIBLE_END), pC.z.abs(),
-            );
-            const ringWispHalf = mix(uLocalHalf, uWispCurveHalf, ringWispProgress);
-            const ringWispWidthMask = float(1).sub(smoothstep(
-                ringWispHalf.mul(0.72), ringWispHalf.mul(1.22), pC.x.abs(),
-            ));
-            const ringWispEndMask = float(1).sub(smoothstep(
-                float(RING_VISIBLE_END - RING_END_FADE),
-                float(RING_VISIBLE_END),
-                pC.z.abs(),
-            ));
-            const wispW = RING_R ? ringWispWidthMask.mul(ringWispEndMask) : float(1);
-            // The old sheet inherited the low deck's t0 fade. At shallow view
-            // angles t0 can still be near while this higher shell hit is tens
-            // of kilometres farther away, collapsing kilometres of texture
-            // into stretched horizon copies. Fade from the sheet's own range.
+            const hit = highCloudHit(org, dir);
+            const wispHitT = hit.x;
             const wispRange = float(1).sub(smoothstep(
                 u.fadeDist.mul(0.55), u.fadeDist.mul(1.25), wispHitT,
             ));
-            // Restore the authored, domain-warped high-cloud field instead of
-            // thresholding four coarse 2D map reads into distant slabs. The
-            // optimized tiers reuse the existing filtered 3D density basis via
-            // fbmE, retaining the organic field without the former ALU lattice
-            // cost. Advect the complete domain at the same world velocity as
-            // the volume below so both sheet masses and cirrus cells visibly
-            // move rather than only changing their internal noise.
-            const wispAdvected = pC.add(vec3(
-                u.skyWind.x.mul(u.time), 0, u.skyWind.z.mul(u.time),
-            ));
-            const wispPatch = fbmE(wispAdvected.mul(0.00016).add(vec3(4.7, 1.3, -2.1)));
-            const wispWarp = fbmE(wispAdvected.mul(0.00031).add(vec3(-1.7, 3.1, 5.3))).sub(0.44);
-            const wispBend = fbmE(wispAdvected.mul(0.00009).add(vec3(8.2, -1.4, 2.7))).sub(0.44);
-            const wispP = wispAdvected.mul(u.wispStretch).mul(u.wispScale)
-                .add(vec3(
-                    wispWarp.mul(1.8).add(wispBend.mul(1.4)),
-                    wispWarp.mul(0.35),
-                    wispWarp.mul(-1.2).add(wispBend.mul(0.7)),
-                ));
-            const wispN = fbmE(wispP);
-            const authoredSheet = smoothstep(u.wispThreshold, u.wispThreshold.add(0.24), wispN)
-                .mul(smoothstep(0.30, 0.62, wispPatch));
-            const sheet = authoredSheet;
-            // Finite mares'-tail plumes. Every safely inset cell may carry one
-            // independently centered, rotated, sized and curved ice plume;
-            // many cells are empty. Because the envelope is zero well before
-            // cell borders, random per-cell parameters never form seams. This
-            // keeps recognizable feathered cirrus without either the old
-            // evenly spaced dashes or a horizon-wide anisotropic stripe field.
-            const cirrusCellP = wispAdvected.xz.mul(0.00013);
-            const cirrusId = floor(cirrusCellP);
-            const cirrusLocal = fract(cirrusCellP).sub(vec2(0.5));
-            const cirrusAngleR = hash3(vec3(cirrusId.x, cirrusId.y, 1.7));
-            const cirrusShapeR = hash3(vec3(cirrusId.x, cirrusId.y, 5.9));
-            const cirrusWidthR = hash3(vec3(cirrusId.x, cirrusId.y, 9.2));
-            const cirrusPresenceR = hash3(vec3(cirrusId.x, cirrusId.y, 13.6));
-            const cirrusCenterX = hash3(vec3(cirrusId.x, cirrusId.y, 17.3)).sub(0.5).mul(0.13);
-            const cirrusCenterY = hash3(vec3(cirrusId.x, cirrusId.y, 21.8)).sub(0.5).mul(0.13);
-            const cirrusX = cirrusLocal.x.sub(cirrusCenterX);
-            const cirrusY = cirrusLocal.y.sub(cirrusCenterY);
-            // A normalized hash vector avoids two transcendental trig calls
-            // per pixel while preserving fully varied plume orientation.
-            const cirrusDirX = cirrusAngleR.sub(0.5);
-            const cirrusDirY = cirrusShapeR.sub(0.5);
-            const cirrusDirInv = float(1).div(max(length(vec2(cirrusDirX, cirrusDirY)), 0.08));
-            const cirrusCos = cirrusDirX.mul(cirrusDirInv);
-            const cirrusSin = cirrusDirY.mul(cirrusDirInv);
-            const cirrusAlong = cirrusX.mul(cirrusCos).add(cirrusY.mul(cirrusSin));
-            const cirrusAcross0 = cirrusY.mul(cirrusCos).sub(cirrusX.mul(cirrusSin));
-            const cirrusLength = cirrusShapeR.mul(0.13).add(0.28);
-            const cirrusWidth = cirrusWidthR.mul(0.046).add(0.048);
-            const cirrusU = cirrusAlong.div(cirrusLength);
-            const cirrusBend = cirrusU.mul(cirrusAngleR.sub(0.5)).mul(cirrusWidth.mul(0.42))
-                .add(cirrusU.mul(cirrusU).mul(cirrusShapeR.sub(0.5)).mul(cirrusWidth.mul(1.55)));
-            const cirrusAcross = cirrusAcross0.sub(cirrusBend);
-            const cirrusTaper = float(1).sub(smoothstep(0.52, 1.0, abs(cirrusU)));
-            const cirrusCoreW = cirrusWidth.mul(cirrusTaper.mul(0.72).add(0.20)).mul(0.34);
-            const cirrusCore = float(1).sub(smoothstep(cirrusCoreW.mul(0.16), cirrusCoreW, abs(cirrusAcross)));
-            const cirrusBranchGate = smoothstep(-0.18, 0.72, cirrusU).mul(cirrusTaper);
-            const cirrusSep = cirrusWidth.mul(smoothstep(-0.4, 0.85, cirrusU).mul(1.05).add(0.42));
-            const cirrusUpperD = cirrusAcross.sub(cirrusSep);
-            const cirrusLowerD = cirrusAcross.add(cirrusSep.mul(0.78));
-            const cirrusUpper = float(1).sub(smoothstep(cirrusCoreW.mul(0.10), cirrusCoreW.mul(0.82), abs(cirrusUpperD)))
-                .mul(0.52).mul(cirrusBranchGate);
-            const cirrusLower = float(1).sub(smoothstep(cirrusCoreW.mul(0.08), cirrusCoreW.mul(0.72), abs(cirrusLowerD)))
-                .mul(0.36).mul(cirrusBranchGate);
-            const cirrusPlumeW = cirrusWidth.mul(2.85);
-            const cirrusPlume = float(1).sub(smoothstep(cirrusWidth.mul(0.55), cirrusPlumeW, abs(cirrusAcross)))
-                .mul(wispN.mul(0.08).add(0.12)).mul(cirrusTaper);
-            // Reuse the already evaluated warped wisp noise for feather
-            // breakup; a dedicated three-octave FBM here cost ~15 fps.
-            const cirrusBreakMask = smoothstep(0.36, 0.70, wispN).mul(0.72).add(0.28);
-            const cirrusPresence = smoothstep(0.20, 0.48, cirrusPresenceR);
-            const fibers = min(cirrusCore.add(cirrusUpper).add(cirrusLower).add(cirrusPlume), 0.96)
-                .mul(cirrusTaper)
-                .mul(cirrusBreakMask)
-                .mul(cirrusPresence)
-                .mul(smoothstep(0.08, 0.60, wispPatch).mul(0.32).add(0.68));
-            // Do not execute the cirrus plume graph for ordinary cumulus,
-            // stratus, Ringworld, or storm sheets. A narrow transition band
-            // still crossfades both fields when weather morphs to/from High
-            // Cirrus, so there is no hard visual swap. This restores the
-            // optimized tiers' budget without removing either cloud element.
-            const wispShape = float(0).toVar();
-            If(u.wispFilament.lessThan(0.55), () => {
-                wispShape.assign(sheet);
-            }).Else(() => {
-                If(u.wispFilament.greaterThan(0.85), () => {
-                    wispShape.assign(fibers);
-                }).Else(() => {
-                    wispShape.assign(mix(sheet, fibers, smoothstep(0.55, 0.85, u.wispFilament)));
-                });
-            });
-            // Severe weather needs broad coverage, not a constant-opacity card.
-            // Treat wispFloor as the strength of a second low-frequency organic
-            // canopy so Dark Storm keeps holes, folds, and soft boundaries.
-            const canopyField = smoothstep(
-                0.18, 0.56,
-                wispPatch.mul(0.72).add(wispBend.add(0.44).mul(0.28)),
-            );
-            // Keep broad severe-weather coverage while preserving internal
-            // cloud structure.  Multiplying the low-frequency canopy by the
-            // already-filtered authored noise prevents its dense interiors
-            // from reading as one flat grey card overhead.
-            const canopyDetail = smoothstep(0.20, 0.82, wispN).mul(0.45).add(0.55);
-            const canopyShape = max(wispShape, canopyField.mul(u.wispFloor).mul(canopyDetail));
-            const wispD = canopyShape.mul(u.wispOn).mul(u.wispStrength).mul(wispW);
-            const wispAlpha = min(wispD.mul(u.wispOpacity), 0.88).mul(wispRange);
+            const wispAlpha = highCloudAlphaAt(org.add(dir.mul(wispHitT))).mul(hit.y).mul(wispRange);
             wispA.assign(wispAlpha);
             // cloudBody speaks premultiplied RGBA: multiply the straight wisp
             // radiance by its actual coverage (the old density-vs-alpha split
             // made every thin sheet intrinsically dark grey).
-            col.addAssign(Tr.mul(u.wispColor).mul(wispAlpha).mul(u.cloudRadiance).mul(u.cloudRadianceScale));
+            const wispKeyChroma=u.cloudLightColor.div(max(max(u.cloudLightColor.x,u.cloudLightColor.y),u.cloudLightColor.z).max(.0001));
+            const wispRadiance=mix(u.wispColor,vec3(dot(u.wispColor,vec3(.2126,.7152,.0722))).mul(wispKeyChroma),u.cloudWeatherGrey);
+            col.addAssign(Tr.mul(wispRadiance).mul(wispAlpha).mul(u.cloudRadiance).mul(u.cloudRadianceScale));
             });
 
             // SEALED LOW CUMULONIMBUS VOLUME. The semantic storm can be roughly
@@ -1595,7 +1525,9 @@ import * as TSL from 'three/tsl';
                 const sy = max(u.cloudLightDir.y, 0.08);
                 const segL = u.cloudHeight.div(sy);
                 const hp = org.add(dir.mul(stepH).mul(baseJit.mul(0.5).add(0.3))).toVar();
-                for (let i = 0; i < 20; i++) {
+                // Keep the authored 20 × 6 samples, but express the march as
+                // GPU loops instead of duplicating its graph 120 times in JS.
+                Loop({ start: 0, end: 20, type: 'int' }, ({i}) => {
                     // ring mode: atmoHeight is a remapped PROFILE coordinate,
                     // not meters — the shaft/altitude math needs physical y
                     // (this is what silently killed the god rays)
@@ -1603,18 +1535,18 @@ import * as TSL from 'three/tsl';
                         ? max(float(RING_SLAB_LO + 20).sub(hp.y), 0).div(sy)
                         : max(u.cloudStart.sub(atmoHeight(hp)), 0).div(sy);
                     const od = float(0).toVar();
-                    for (let j = 0; j < 6; j++) {
-                        od.addAssign(smoothDensity(hp.add(u.cloudLightDir.mul(hEnter.add(segL.mul((j + 0.5) / 6))))));
-                    }
+                    Loop({ start: 0, end: 6, type: 'int' }, ({i: j}) => {
+                        od.addAssign(smoothDensity(hp.add(u.cloudLightDir.mul(hEnter.add(segL.mul(float(j).add(0.5).div(6)))))));
+                    });
                     const vis = exp(od.mul(segL.div(6)).negate());
                     // rain curtains: dense macro cells rain; fine xz column
                     // noise gives the falling-shaft texture
-                    const cp1z = hp.z.add(u.skyWind.z.mul(u.time));
-                    const cp1x = hp.x.add(u.skyWind.x.mul(u.time));
+                    const cp1z = hp.z.add(u.cloudDisplacement.z.negate());
+                    const cp1x = hp.x.add(u.cloudDisplacement.x.negate());
                     const cellCov = clamp(wSampleL(vec2(cp1z, cp1x).mul(float(-0.00005).mul(u.wScale))).sub(u.largeT).mul(u.largeA), 0, 2);
                     // column texture coarsened + faded to smooth murk with
                     // distance — fine detail must stay below the step size
-                    const tCur = stepH.mul(i + 0.5);
+                    const tCur = stepH.mul(float(i).add(0.5));
                     const colTex = wSampleS(vec2(cp1z, cp1x).mul(0.0008).add(vec2(0.61, 0.23)));
                     const colMod = mix(colTex.mul(1.1).add(0.25), float(0.8), smoothstep(900, 2600, tCur));
                     const belowBase = RING_R
@@ -1637,7 +1569,8 @@ import * as TSL from 'three/tsl';
                         stormPrecipGate,
                         clamp(u.stormCanopy, 0, 1),
                     );
-                    const precip = u.precipK.mul(precipGate).mul(colMod).mul(2.1e-4 * (1 - (i / 20) * 0.5))
+                    const precip = u.precipK.mul(precipGate).mul(colMod)
+                        .mul(float(i).div(20).mul(0.5).oneMinus().mul(2.1e-4))
                         .mul(belowBase.mul(0.5).add(0.5));
                     const altPhys = RING_R ? hp.y : atmoHeight(hp);
                     // ring mode: curtains OFF pending their own tune — they were
@@ -1648,7 +1581,7 @@ import * as TSL from 'three/tsl';
                     shaft.addAssign(trH.mul(vis.mul(0.75).add(0.25)).mul(rho).mul(stepH));
                     trH.assign(trH.mul(exp(rho.mul(stepH).negate())));
                     hp.assign(hp.add(dir.mul(stepH)));
-                }
+                });
             });
             // curtains scatter AMBIENT skylight too — sun-only lighting rendered
             // distant rain as a black wall at the horizon. Under a sealed
@@ -1667,7 +1600,7 @@ import * as TSL from 'three/tsl';
             const dg2 = OUTPUT_DITHER > 0
                 ? hashScreen(screenCoordinate.xy.add(vec2(17.3, 41.7))).sub(0.5).mul(OUTPUT_DITHER).mul(coverT)
                 : float(0);
-            return vec4(cloudRgb.add(shaftCol).add(vec3(dg2, dg2, dg2)), coverT);
+            return vec4(cloudRgb.add(shaftCol).mul(u.solarSkyVisibility).add(vec3(dg2, dg2, dg2)), coverT);
         };
         const cloudOut = Fn(() => cloudBody(screenRayDir(), cameraPosition));
         // analytic ringworld band along a ray — SHARED by the env bake and the
@@ -1881,7 +1814,7 @@ import * as TSL from 'three/tsl';
             if (opts.celestial) col.assign(mix(col, opts.celestial(dir, col), clamp(u.celestialVisibility, 0, 1)));
             // HDR sun disc + corona
             const disc = smoothstep(0.99995, 0.999985, mu);
-            col.addAssign(u.sunColor.mul(disc).mul(u.sunDiscI).mul(u.celestialVisibility));
+            col.addAssign(u.sunColor.mul(disc).mul(u.sunDiscI).mul(u.celestialVisibility).mul(u.solarVisibility));
             col.addAssign(u.sunColor.mul(pow(max(mu, 0.0), 900.0)).mul(3.0).mul(u.sunGlowI).mul(u.celestialVisibility));
             col.addAssign(u.sunColor.mul(pow(max(mu, 0.0), 60.0)).mul(0.22).mul(u.sunGlowI).mul(u.celestialVisibility));
             // Optional stable lookdev dither. Production output is HDR here;
@@ -1890,7 +1823,7 @@ import * as TSL from 'three/tsl';
                 ? hashScreen(screenCoordinate.xy.add(vec2(53.1, 9.7))).sub(0.5).mul(OUTPUT_DITHER)
                 : float(0);
             col.addAssign(vec3(dg, dg, dg));
-            return vec4(col, 1);
+            return vec4(col.mul(u.solarSkyVisibility), 1);
         };
         const bgOut = Fn(() => bgBody(screenRayDir()));
         const bgMat = noGBuffer(new T3.MeshBasicNodeMaterial({ side: T3.BackSide, depthWrite: false, fog: false }));
@@ -2010,10 +1943,29 @@ import * as TSL from 'three/tsl';
         // not stack TSL graphs and disposal can sever references to this sky's
         // uniforms/textures. Weather may restore an earlier root first, hence
         // the identity check during cleanup.
+        const updateCloudKey = () => {
+            const pal = state.palette;
+            const nightK = u.moonLightK.value;
+            const moonUp = Math.max(0, Math.min(1, sys.moonDir.y / 0.12));
+            const moonGain = 1.3 * nightK * moonUp * moonUp * (3 - 2 * moonUp);
+            const sunGain = pal.int * 7 * (opts.cloudLightScale ?? 1);
+            const moonTint = opts.moonLightColor ?? [0.45, 0.55, 0.85];
+            const tint = opts.cloudLightTint;
+            u.cloudLightColor.value.set(
+                (pal.sun[0] * sunGain * (tint?.[0] ?? 1) * (1 - nightK) + moonTint[0] * moonGain * nightK) * SKY_COLOR.cloud[0],
+                (pal.sun[1] * sunGain * (tint?.[1] ?? 1) * (1 - nightK) + moonTint[1] * moonGain * nightK) * SKY_COLOR.cloud[1],
+                (pal.sun[2] * sunGain * (tint?.[2] ?? 1) * (1 - nightK) + moonTint[2] * moonGain * nightK) * SKY_COLOR.cloud[2],
+            );
+            u.cloudLightDir.value.copy(nightK > 0.5 ? sys.moonDir : sys.sunDir);
+        };
         const cloudShadowRoots = new Map();
+        const cloudMotion = createCloudMotion();
+        let cloudShadowMap = null;
+        let cloudShadowSun = null;
         let disposed = false;
         const sys = {
             uniforms: u, state, cloudTransitionInfo,
+            _solarOcclusion: null,
             domes: [bgDome, cloudDome],
             sunDir: V(0, 1, 0), moonDir: V(0, -1, 0),
             stormCanopyInfo: {
@@ -2039,12 +1991,12 @@ import * as TSL from 'three/tsl';
                 } : null,
             },
             cloudShadowInfo: {
-                mode: 'world-space-sun-column',
+                mode: 'cached-world-space-sun-column',
                 samples: N_CLOUD_SHADOW,
                 followsCloudWind: true,
                 arbitraryGeometry: true,
                 qualityAffectsBudgetOnly: true,
-                densityField: 'first-erosion-visible-cloud-mass',
+                densityField: 'same-extinction-as-visible-clouds',
             },
             reflectionInfo: {
                 mode: 'native-equirectangular-pmrem',
@@ -2070,8 +2022,8 @@ import * as TSL from 'three/tsl';
                 lightCacheDirty = !!lightCacheCompute;
             },
             async prepareOptimizedCaches(renderer, camera, force = false) {
-                if (!lightCacheCompute || state.preset === 'clear' || u.finalMul.value <= 0.0001
-                    || u.lightCacheDirect.value >= 0.999) return false;
+                if (!lightCacheCompute || (!force && (state.preset === 'clear' || u.finalMul.value <= 0.0001
+                    || u.lightCacheDirect.value >= 0.999))) return false;
                 const cam = camera ?? globalThis._c;
                 if (!cam) return false;
                 const [LX, , LZ] = lightCacheDims;
@@ -2128,16 +2080,6 @@ import * as TSL from 'three/tsl';
             setConstellationVisibility(visibility) {
                 u.constellationVisibility.value = Math.max(0, Math.min(1, visibility ?? 0));
             },
-            setMoonDirection(direction) {
-                if (!direction) return;
-                sys.moonDir.copy(direction).normalize();
-                u.moonDir.value.copy(sys.moonDir);
-                const mr = V(0, 1, 0).cross(sys.moonDir);
-                if (mr.lengthSq() < 1e-8) mr.set(1, 0, 0);
-                mr.normalize();
-                u.moonRight.value.copy(mr);
-                u.moonUp.value.copy(sys.moonDir.clone().cross(mr).normalize());
-            },
             setSunDirection(direction) {
                 if (!direction) return;
                 const normalizedDirection = direction.clone().normalize();
@@ -2159,41 +2101,9 @@ import * as TSL from 'three/tsl';
                     pal.sun[2] * SKY_COLOR.sun[2]);
                 u.starFade.value = pal.star;
                 u.hdriDim.value = Math.max(0.04, Math.min(1, 0.1 + pal.int * 0.45));
-                // cloud lighting: sun by day, MOON by night (smooth handoff in twilight)
                 const nightK = Math.max(0, Math.min(1, (-elDeg - 2) / 8));
                 u.moonLightK.value = nightK;
-                // donor calibration: reference shader is HDR-native and the engine
-                // effect rescales by colorScale 0.08 for ACES (cloud bodies ~1-3,
-                // sky bg ~0.1-0.5). Baked into these coefficients.
-                // opts.cloudLightScale — scales ONLY the star-driven cloud
-                // light, leaving the ambient/skylight term (ambGrey) intact.
-                // A world under a tinted star needs its sunlit cloud radiance
-                // pulled under the ACES knee, but doing that with cloudTint
-                // scales the ambient term too and the clouds go BLACK once the
-                // star is down. This knob dims the key, not the fill.
-                // opts.cloudLightTint — PER-CHANNEL key balance, [r,g,b].
-                // A scalar dim cannot fix a tinted star and neither can
-                // desaturating toward grey (that just yields grey cloud):
-                // sunlit radiance here is ~(21, 5.9, 2.1), and ACES converges
-                // on white whenever ONE channel runs far ahead of the others.
-                // What works is REBALANCING the channels — cutting red hardest
-                // (a tint like [0.07, 0.11, 0.16], blue-weighted) so the peak
-                // lands under the knee with the ratio intact. The result
-                // tone-maps to copper with structure instead of white.
-                // Applied to the KEY only, so the ambient/skylight fill is
-                // untouched and clouds keep their form after the star sets.
-                const sunBase = V(...pal.sun);
-                const clTint = opts.cloudLightTint;
-                if (clTint) sunBase.multiply(V(clTint[0], clTint[1], clTint[2]));
-                const sunCol = sunBase.multiplyScalar(pal.int * 7 * (opts.cloudLightScale ?? 1));
-                const moonCol = V(0.45, 0.55, 0.85).multiplyScalar(1.3 * nightK);
-                // NOTE: this uniform is a Vector3, not a Color (sunCol/moonCol
-                // are built with V()). Multiplying it by a THREE.Color gives
-                // NaN on every channel — Vector3.multiply reads .x/.y/.z and a
-                // Color only carries .r/.g/.b — which renders the clouds dark.
-                u.cloudLightColor.value.copy(sunCol.lerp(moonCol, nightK))
-                    .multiply(V(...SKY_COLOR.cloud));
-                u.cloudLightDir.value.copy(nightK > 0.5 ? sys.moonDir : sys.sunDir);
+                updateCloudKey();
                 // opts.cloudAmbScale — the cloud FILL term, i.e. what lights a
                 // cloud face turned away from the star. It is derived from the
                 // zenith colour, and under a red paletteTint the red tint
@@ -2211,6 +2121,17 @@ import * as TSL from 'three/tsl';
                 // Preset tint differentiates cool stratus from warm cumulus
                 // and clean white cirrus.
                 updateWispColor();
+            },
+            setMoonDirection(direction) {
+                if (!direction) return;
+                sys.moonDir.copy(direction).normalize();
+                u.moonDir.value.copy(sys.moonDir);
+                const mr = V(0, 1, 0).cross(sys.moonDir);
+                if (mr.lengthSq() < 1e-8) mr.set(1, 0, 0);
+                mr.normalize();
+                u.moonRight.value.copy(mr);
+                u.moonUp.value.copy(sys.moonDir.clone().cross(mr).normalize());
+                updateCloudKey();
             },
             setTime(hours) {
                 state.hours = hours;
@@ -2238,7 +2159,12 @@ import * as TSL from 'three/tsl';
                     const n = ((w - 18) + 24) % 24;          // 0..12 across the night
                     return span * Math.PI * 0.5 + n / 12 * (2 - span) * Math.PI;
                 };
-                const az = state.azBase + arcAz(hours, state.azSpanK);
+                let az = state.azBase + arcAz(hours, state.azSpanK);
+                // Align this world's daytime transit with its ring. Ease the
+                // correction to zero at dawn/dusk and leave the night arc and
+                // companion trajectory exactly as authored.
+                if(Number.isFinite(opts.noonAzimuth))az+=(opts.noonAzimuth-state.azBase)
+                    *Math.max(0,Math.sin(dayK*Math.PI))**2;
                 // moon: the opposite arc, and the same continuity requirement — its
                 // own (hours + 6) % 24 term jumped at 18h, right at moonrise.
                 const mel = Math.sin(((hours + 12 - 6) / 12) * Math.PI) * 48 * Math.PI / 180;
@@ -2368,29 +2294,39 @@ import * as TSL from 'three/tsl';
                 return true;
             },
             applyToLights({ sun, hemi, fog } = {}) {
+                if (sun) cloudShadowSun = sun;
                 const pal = state.palette;
                 const nightK = u.moonLightK.value;
                 if (sun) {
                     // At night this light BECOMES the moonlight: it tracks the
                     // moon and takes a cool blue-white, which is correct for
-                    // Earth — our moonlight looks blue only because Sol is
-                    // white. It is WRONG for any tinted star: a moon orbiting
-                    // a ~3200 K red giant reflects ORANGE light, and there is
-                    // no white light in such a system to make a blue moonbeam.
+                    // Earth. A companion orbiting a tinted star instead
+                    // reflects that star's warmer spectrum.
                     // opts.moonLightColor / moonLightIntensity let a world set
                     // its own; defaults are the Earth values.
                     const ml = opts.moonLightColor ?? [0.5, 0.6, 0.95];
-                    sun.color.setRGB(...pal.sun).lerp(new T3.Color(ml[0], ml[1], ml[2]), nightK)
-                    .multiply(new T3.Color(...SKY_COLOR.sun));
-                    sun.intensity = Math.max(0.08, pal.int * 1.15) * (1 - nightK)
-                        + (opts.moonLightIntensity ?? 0.35) * nightK;
+                    sun.color.setRGB(
+                        (pal.sun[0] * (1 - nightK) + ml[0] * nightK) * SKY_COLOR.sun[0],
+                        (pal.sun[1] * (1 - nightK) + ml[1] * nightK) * SKY_COLOR.sun[1],
+                        (pal.sun[2] * (1 - nightK) + ml[2] * nightK) * SKY_COLOR.sun[2],
+                    );
+                    const moonUp = Math.max(0, Math.min(1, sys.moonDir.y / 0.12));
+                    // A spatial occluder shadows each receiver in its material.
+                    // Camera coverage still dims the sky, not every sunlit roof.
+                    const solarGain = sys._solarOcclusion ? 1 : u.solarVisibility.value;
+                    sun.intensity = Math.max(0.08, pal.int * 1.15) * (1 - nightK) * solarGain
+                        + (opts.moonLightIntensity ?? 0.35) * nightK * moonUp * moonUp * (3 - 2 * moonUp);
                     const d = nightK > 0.5 ? sys.moonDir : sys.sunDir;
-                    sun.position.copy(d.clone().multiplyScalar(120));
+                    sun.position.copy(d).multiplyScalar(120);
                 }
                 if (hemi) {
-                    hemi.color.setRGB(...pal.zen).multiplyScalar(2.2);
-                    hemi.groundColor.setRGB(pal.hor[0] * 0.25, pal.hor[1] * 0.2, pal.hor[2] * 0.18);
-                    hemi.intensity = 0.25 + pal.int * 0.25 + nightK * 0.06;
+                    // Match the weathered sky used by the view and IBL bake.
+                    // A clear blue fill under grey rain lit buildings with a
+                    // different spectrum from the clouds and reflected sky.
+                    const zen=u.zenith.value,hor=u.horizon.value;
+                    hemi.color.setRGB(zen.x,zen.y,zen.z).multiplyScalar(2.2);
+                    hemi.groundColor.setRGB(hor.x * 0.25, hor.y * 0.2, hor.z * 0.18);
+                    hemi.intensity = (0.25 + pal.int * 0.25 + nightK * 0.06) * u.solarSkyVisibility.value;
                 }
                 // FOG FOLLOWS THE WEATHERED SKY, not the clean TOD palette.
                 // pal.hor is the authored time-of-day horizon; the weather
@@ -2408,6 +2344,7 @@ import * as TSL from 'three/tsl';
                     if (h) fog.color.setRGB(h.x * F[0], h.y * F[1], h.z * F[2]).multiplyScalar(0.5 + pal.int * 0.12);
                     else fog.color.setRGB(pal.hor[0] * F[0], pal.hor[1] * F[1], pal.hor[2] * F[2]).multiplyScalar(0.5 + pal.int * 0.12);
                 }
+                if(fog?.color)fog.color.multiplyScalar(u.solarSkyVisibility.value);
                 return pal;
             },
             // world weather-field access — the SAME macro coverage the clouds
@@ -2417,9 +2354,9 @@ import * as TSL from 'three/tsl';
                 const sc = 0.00005 * u.wScale.value;
                 const t = u.time.value;
                 const wrap = (v) => { let f = v % 1; if (f < 0) f += 1; return f; };
-                const wv = u.skyWind.value;
-                const uu = wrap(-((z + t * wv.z) * sc)) * WSZ;
-                const vv = wrap(-((x + t * wv.x) * sc)) * WSZ;
+                const drift = u.cloudDisplacement.value;
+                const uu = wrap(-((z - drift.z) * sc)) * WSZ;
+                const vv = wrap(-((x - drift.x) * sc)) * WSZ;
                 const x0 = Math.floor(uu) % WSZ, y0 = Math.floor(vv) % WSZ;
                 const x1 = (x0 + 1) % WSZ, y1 = (y0 + 1) % WSZ;
                 const fx = uu - Math.floor(uu), fy = vv - Math.floor(vv);
@@ -2428,33 +2365,25 @@ import * as TSL from 'three/tsl';
                           + (rAt(x0, y1) * (1 - fx) + rAt(x1, y1) * fx) * fy;
                 return Math.max(0, Math.min(2, (val - u.largeT.value) * u.largeA.value));
             },
-            // Cloud-shadow factor for an arbitrary world position (multiply
-            // into a material's colorNode). It traces from that receiver toward
-            // the actual sun through the same moving density field as the sky.
-            // The fixed quality tier controls only N_CLOUD_SHADOW.
-            // cheapDensity includes the first erosion octave from the visible
-            // cloud mass. The erosion-free shaft proxy has a ~20 km footprint
-            // and merely pulses the whole local scene darker/brighter; it is
-            // stable for godrays but cannot draw travelling ground patches.
-            tslCloudShadow(pWorld, strength = 0.55) {
+            // Transmittance toward the active celestial key, evaluated through
+            // the same moving density field as the visible clouds. Apply this
+            // to direct light, never to the material's albedo or ambient light.
+            // This same-density reference is used by the cached shadow pass
+            // and the numerical height/projection review.
+            tslCloudTransmittance(pWorld) {
                 return Fn(() => {
-                    const dy = max(u.sunDir.y, 0.08);
+                    const dy = max(u.cloudLightDir.y, 0.001);
                     const stormK = clamp(u.stormCanopy, 0, 1);
-                    const shadowBottom = mix(u.cloudStart, stormLayerBottom(), stormK);
-                    const shadowDepth = mix(u.cloudHeight, stormLayerDepth(), stormK);
-                    const hEnter = max(shadowBottom.sub(pWorld.y), 0).div(dy);
-                    const segL = shadowDepth.div(dy);
-                    // Distant receivers sample the animated FBM at world+time
-                    // coordinates where float precision breaks down, so their
-                    // shadow patches pop bright/dark. Blend the noisy density
-                    // toward a stable coverage-mean extinction with receiver
-                    // distance: near ground keeps travelling patches, far
-                    // ground keeps steady weather-correct dimming.
-                    const farK = smoothstep(
-                        float(1800), float(5200),
-                        length(pWorld.sub(cameraPosition)),
-                    );
-                    const meanExtinction = clamp(u.finalMul, 0, 1).mul(0.030);
+                    const ordinaryBottom = RING_R ? ringDeckY(pWorld.z) : u.cloudStart;
+                    const stormBottom = RING_R
+                        ? ringDeckY(pWorld.z).sub(RING_BASE).add(stormLayerBottom())
+                        : stormLayerBottom();
+                    const shadowBottom = mix(ordinaryBottom, stormBottom, stormK);
+                    const shadowDepth = mix(RING_R ? float(RING_THICK) : u.cloudHeight, stormLayerDepth(), stormK);
+                    const hEnter = RING_R?max(shadowBottom.sub(pWorld.y),0).div(dy)
+                        :max(shellFar(pWorld,u.cloudLightDir,shadowBottom),0);
+                    const segL = RING_R?shadowDepth.div(dy)
+                        :max(shellFar(pWorld,u.cloudLightDir,shadowBottom.add(shadowDepth)).sub(hEnter),0);
                     const od = float(0).toVar();
                     // Once a settled canopy has made celestial visibility zero,
                     // the real scene key is already exactly zero; skip every
@@ -2462,71 +2391,113 @@ import * as TSL from 'three/tsl';
                     // that cannot contribute. During the transition, this same
                     // field continuously occludes the remaining key.
                     If(u.celestialVisibility.greaterThan(0.001), () => {
-                        for (let j = 0; j < N_CLOUD_SHADOW; j++) {
-                            const along = hEnter.add(segL.mul((j + 0.5) / N_CLOUD_SHADOW));
-                            const sampleP = pWorld.add(u.sunDir.mul(along));
+                        Loop({ start: 0, end: N_CLOUD_SHADOW, type: 'int' }, ({i}) => {
+                            If(od.mul(segL.div(N_CLOUD_SHADOW)).greaterThan(9), () => Break());
+                            const along = hEnter.add(segL.mul(float(i).add(0.5).div(N_CLOUD_SHADOW)));
+                            const sampleP = pWorld.add(u.cloudLightDir.mul(along));
                             const ordinaryExtinction = float(0).toVar();
                             const stormExtinction = float(0).toVar();
                             If(stormK.lessThan(0.999), () => {
-                                ordinaryExtinction.assign(mix(
-                                    cheapDensity(sampleP).mul(0.018),
-                                    meanExtinction,
-                                    farK,
-                                ));
+                                ordinaryExtinction.assign(cloudsAt(sampleP).density);
                             });
                             If(stormK.greaterThan(0.001), () => {
                                 stormExtinction.assign(stormShadowExtinctionAt(sampleP));
                             });
                             od.addAssign(mix(ordinaryExtinction, stormExtinction, stormK));
-                        }
+                        });
                     });
                     // Both paths are converted to extinction per metre before
                     // integration, so storm core/scud casts the same continuous
                     // moving material shadow as the visible Beer volume.
                     const opticalDepth = od.mul(segL.div(N_CLOUD_SHADOW));
                     const occ = float(1).sub(exp(opticalDepth.negate()));
-                    const daylight = smoothstep(0.02, 0.16, u.sunDir.y)
-                        .mul(clamp(u.celestialVisibility, 0, 1));
                     const cloudMass = max(
                         smoothstep(0.0001, 0.02, u.finalMul),
                         smoothstep(0.0001, 0.02, u.stormCanopy),
                     );
-                    // cloudShadowStrength is a live debug/isolation multiplier.
-                    return float(1).sub(
-                        occ.mul(strength)
-                            .mul(u.cloudShadowStrength)
-                            .mul(daylight)
-                            .mul(cloudMass),
-                    );
+                    const lowTransmission = float(1).sub(occ.mul(cloudMass));
+                    const iceOpacity = float(0).toVar();
+                    If(u.wispOn.greaterThan(0.0001).and(u.celestialVisibility.greaterThan(0.001))
+                        .and(u.cloudLightDir.y.greaterThan(0.001)), () => {
+                        const hit = highCloudHit(pWorld, u.cloudLightDir);
+                        iceOpacity.assign(highCloudAlphaAt(pWorld.add(u.cloudLightDir.mul(hit.x)))
+                            .mul(hit.y).mul(mix(0.22, 0.42, float(1).sub(u.wispFilament))));
+                    });
+                    return lowTransmission.mul(float(1).sub(iceOpacity));
                 })();
             },
-            // wrap scene materials with cloud shadowing (composes with other
-            // colorNode wrappers, e.g. the weather system's wetness)
-            wrapCloudShadows(sceneRoot, strength = 0.55) {
+            tslCloudShadow(pWorld, strength = 1) {
+                const transmittance = cloudShadowMap.sample(pWorld);
+                // Celestial visibility controls the background disc. Rain
+                // must not make an opaque cloud transparent to direct light.
+                const daylight = smoothstep(-0.005, 0.012, u.cloudLightDir.y);
+                const belowDeck = float(1).sub(smoothstep(u.cloudStart,
+                    u.cloudStart.add(u.cloudHeight), atmoHeight(pWorld)));
+                return float(1).sub(float(1).sub(transmittance).mul(strength)
+                    .mul(u.cloudShadowStrength).mul(daylight).mul(belowDeck));
+            },
+            async prepareCloudShadows(renderer, camera, force = false) {
+                return cloudShadowMap.prepare(renderer, camera, force);
+            },
+            // Optional world-space solar visibility, e.g. a megastructure's
+            // moving shadow. Returns a TSL scalar (0 blocked, 1 clear) for the
+            // receiver. Call when attaching/detaching an occluder, not per frame.
+            setSolarOcclusion(nodeFactory = null) {
+                if (nodeFactory !== null && typeof nodeFactory !== 'function') throw new TypeError('Expected a solar visibility node factory');
+                if (sys._solarOcclusion === nodeFactory) return;
+                sys._solarOcclusion = nodeFactory;
+                for (const material of cloudShadowRoots.keys()) material.needsUpdate = true;
+                sys.wrapCloudShadows(scene);
+            },
+            // Preserve native material response, including indirect sky light,
+            // emissive, wetness and alpha tests. Only the scene's celestial key
+            // receives cloud attenuation; flashlights and temple lights remain local.
+            wrapCloudShadows(sceneRoot, strength = 1) {
                 const done = new Set();
                 let n = 0;
                 (sceneRoot || scene).traverse((o) => {
-                    if (!o.isMesh || o.userData.noCloudShadow) return;
+                    if (!o.isMesh || (o.userData.noCloudShadow
+                        && (!sys._solarOcclusion || o.userData.noSolarShadow))) return;
                     if (sys.domes.includes(o)) return;
                     const mats = Array.isArray(o.material) ? o.material : [o.material];
                     for (const m of mats) {
-                        const isPbrNode = m?.isMeshStandardNodeMaterial
+                        const isPbr = m?.isMeshStandardMaterial || m?.isMeshPhysicalMaterial
+                            || m?.isMeshStandardNodeMaterial
                             || m?.isMeshPhysicalNodeMaterial
                             || (m?.isNodeMaterial
                                 && m.roughness !== undefined
                                 && m.metalness !== undefined);
-                        if (!isPbrNode || m.userData?.keepEnv
+                        if (!isPbr
                             || done.has(m) || cloudShadowRoots.has(m)) continue;
                         done.add(m);
-                        const original = m.colorNode;
-                        // Shade RGB only. Multiplying the complete RGBA root
-                        // raises alpha-test cutoffs under clouds and can erase
-                        // thin foliage long before its lighting changes.
-                        const baseColor4 = T3.vec4(original ?? T3.materialColor);
-                        const shade = sys.tslCloudShadow(T3.positionWorld, strength);
-                        const wrapped = T3.vec4(baseColor4.rgb.mul(shade), baseColor4.a);
+                        const original = m.setupLightingModel;
+                        // The renderer converts imported standard/physical
+                        // materials to node materials and copies enumerable
+                        // properties. Carry this hook into that conversion,
+                        // preserving the imported maps and native PBR model.
+                        const setup = original ?? (m.isMeshPhysicalMaterial
+                            ? T3.MeshPhysicalNodeMaterial.prototype.setupLightingModel
+                            : T3.MeshStandardNodeMaterial.prototype.setupLightingModel);
+                        const wrapped = function (builder) {
+                            const model = setup.call(this, builder);
+                            const direct = model.direct;
+                            model.direct = function (lightData, lightBuilder) {
+                                if (lightData.lightNode?.light === cloudShadowSun) {
+                                    const flags = lightBuilder.object?.userData;
+                                    let color = lightData.lightColor;
+                                    if (!flags?.noCloudShadow) color = color.mul(sys.tslCloudShadow(T3.positionWorld, strength));
+                                    if (sys._solarOcclusion && !flags?.noSolarShadow) {
+                                        const visibility = T3.mix(sys._solarOcclusion(T3.positionWorld), 1, u.moonLightK);
+                                        color = color.mul(visibility);
+                                    }
+                                    if (color !== lightData.lightColor) lightData = { ...lightData, lightColor: color };
+                                }
+                                return direct.call(this, lightData, lightBuilder);
+                            };
+                            return model;
+                        };
                         cloudShadowRoots.set(m, { original, wrapped });
-                        m.colorNode = wrapped;
+                        m.setupLightingModel = wrapped;
                         m.needsUpdate = true;
                         n++;
                     }
@@ -2545,7 +2516,7 @@ import * as TSL from 'three/tsl';
             },
             // TSL coverage node for shader-side gating (xz = world coords):
             tslCoverage(xz) {
-                const uvW = vec2(xz.y.add(u.skyWind.z.mul(u.time)), xz.x.add(u.skyWind.x.mul(u.time))).mul(float(-0.00005).mul(u.wScale));
+                const uvW = vec2(xz.y.add(u.cloudDisplacement.z.negate()), xz.x.add(u.cloudDisplacement.x.negate())).mul(float(-0.00005).mul(u.wScale));
                 return clamp(weatherNode.sample(uvW).level(0).r.sub(u.largeT).mul(u.largeA), 0, 2);   // EANPA: explicit LOD
             },
             // MOVING per-pixel cloud reflections on metals. The hook raymarches
@@ -2566,6 +2537,19 @@ import * as TSL from 'three/tsl';
                 return target;
             },
             enableReflections(camera, ropts = {}) {
+                const externalPbrResponse = ropts.externalPbrResponse === true;
+                // Re-registering on the same sky instance must release the
+                // placeholder and globals owned by the previous hook graph.
+                if (globalThis._autoEnhanceCloudReflectHook === sys._reflectionHook) {
+                    globalThis._autoEnhanceCloudReflectHook = null;
+                }
+                if (globalThis._autoEnhanceCloudReflectBlurHook === sys._reflectionBlurHook) {
+                    globalThis._autoEnhanceCloudReflectBlurHook = null;
+                }
+                if (sys._envFbNode) sys._envFbNode.value = null;
+                sys._envFbNode = null;
+                sys._envFbPlaceholder?.dispose?.();
+                sys._envFbPlaceholder = null;
                 // EIDOVERSE PORT: the hook suppresses material env-IBL and SSR
                 // only covers camera-visible ground — below-horizon rays whose
                 // target the camera cannot see (e.g. the ground directly under
@@ -2580,6 +2564,7 @@ import * as TSL from 'three/tsl';
                 const envFbPlaceholder = new T3.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
                 envFbPlaceholder.needsUpdate = true;
                 const envFbNode = T3.texture(envFbPlaceholder);
+                sys._envFbPlaceholder = envFbPlaceholder;
                 sys._envFbNode = envFbNode;
                 // debug modes REPLACE the final image (render_scene checks this
                 // flag in the deferred compose) — additive debug over a lit
@@ -2620,8 +2605,14 @@ import * as TSL from 'three/tsl';
                         // into the sharp source before roughness mip filtering.
                         // Environment rays have no finite geometry-hit distance,
                         // so SSR's hit-distance attenuation is intentionally 1.
-                        const op = float(ropts.gain ?? 1.0).mul(metalness).toVar();
-                        op.mulAssign(fresnelCoe);
+                        // The deferred reflection pipeline owns receiver PBR
+                        // response in external mode. Emit same-ray environment
+                        // radiance there; legacy callers retain the exact
+                        // metalness * Fresnel weighting used before this mode.
+                        const op = externalPbrResponse
+                            ? float(ropts.gain ?? 1.0).toVar()
+                            : float(ropts.gain ?? 1.0).mul(metalness).toVar();
+                        if (!externalPbrResponse) op.mulAssign(fresnelCoe);
                         const reflRO = worldPos.add(worldNormal.mul(0.05));
                         const cloudCol = vec3(0).toVar();
                         // The horizon transition is metadata for the final
@@ -2714,15 +2705,24 @@ import * as TSL from 'three/tsl';
                         // multiply as the production five-mip path.
                         const stage1 = mix(sharp, lightBlur.rgb, smoothstep(0.0, 0.25, r2));
                         const stage2 = mix(stage1, heavyBlur.rgb, smoothstep(0.25, 1.0, r2));
-                        return vec4(stage2.mul(mr.r), 1.0);
+                        return vec4(externalPbrResponse ? stage2 : stage2.mul(mr.r), 1.0);
                     })();
                 };
+                sys._reflectionHook = reflHook;
+                sys._reflectionBlurHook = ropts.blur !== false ? reflBlur : null;
+                reflHook.selfGated = true;
+                reflHook.externalPbrResponse = externalPbrResponse;
                 globalThis._autoEnhanceCloudReflectHook = reflHook;
                 // this hook gates by REFLECTION DIRECTION internally — tell the
                 // engine to skip its blunt N·up multiply (kept for the old
                 // screenspace effect, whose hook doesn't self-gate)
-                globalThis._autoEnhanceCloudReflectHook.selfGated = true;
-                if (ropts.blur !== false) globalThis._autoEnhanceCloudReflectBlurHook = reflBlur;
+                if (ropts.blur !== false) {
+                    globalThis._autoEnhanceCloudReflectBlurHook = reflBlur;
+                } else {
+                    // A previous registration may have installed a blur hook;
+                    // it must not process this raw-radiance source implicitly.
+                    globalThis._autoEnhanceCloudReflectBlurHook = null;
+                }
                 // standalone godrays effect can't see these clouds — trip its
                 // mutual-exclusion sentinel (the sky carries its own shafts)
                 globalThis._volumetricCloudsActive = true;
@@ -2785,7 +2785,11 @@ import * as TSL from 'three/tsl';
                 // on every weather/cloud reflection update. Everything the
                 // graph reads at render time is uniform-driven; only the
                 // baked-in branches below participate in the cache key.
-                const cloudsOn = bopts.includeClouds !== false && state.preset !== 'clear';
+                // Cloud presets are uniform state, never shader variants. A
+                // clear -> cloudy switch previously discarded this very large
+                // graph and synchronously compiled it again during play.
+                // cloudBody already skips its volume/wisps at zero density.
+                const cloudsOn = bopts.includeClouds !== false;
                 const bakeKey = `${W}x${H}|p${bopts.cloudPasses ?? 'd'}|c${cloudsOn ? 1 : 0}`;
                 let bake = sys._envBake;
                 if (!bake || bake.key !== bakeKey || bake.rw !== (rw ?? null)) {
@@ -2856,19 +2860,12 @@ import * as TSL from 'three/tsl';
                 // hand the now-rendered bake to the reflection hook's
                 // below-horizon fallback (it boots on a 1x1 placeholder)
                 if (sys._envFbNode) sys._envFbNode.value = target.texture;
-                // Assigning the bake to scene.environment is HOST-DEPENDENT, and
-                // this is the one place the two hosts genuinely disagree:
-                //   • offline renderer — wants it. The sky owns the world's light,
-                //     and env-IBL is how clouds reach reflections.
-                //   • browser (the realtime host) — must NOT have it by default.
-                //     Chrome suppresses Basic-family sky domes once
-                //     scene.environment is set, which blanks the sky entirely.
-                // So the default follows the host rather than being hard-coded to
-                // either, which keeps ONE shared engine file correct in both and
-                // avoids the forked-copy drift that has bitten this code before.
-                // bopts.assign forces it either way; bopts.ifAbsent respects an
-                // HDRI the scene already set.
-                const assignEnv = bopts.assign ?? !!globalThis.Deno;
+                // The realtime browser must not receive a global environment by
+                // default: Chrome suppresses Basic-family sky domes once
+                // scene.environment is set. Consumers that explicitly own a
+                // scene-level environment can opt in with bopts.assign=true;
+                // bopts.ifAbsent then respects an HDRI the scene already set.
+                const assignEnv = bopts.assign ?? false;
                 if (assignEnv && !(bopts.ifAbsent && scene.environment)) {
                     scene.environment = target.texture;
                     console.log(`[sky] env bake ${W}x${H} -> scene.environment (clouds reach reflections via env-IBL)`);
@@ -2880,6 +2877,7 @@ import * as TSL from 'three/tsl';
             update(t, camera) {
                 const finiteT = Number.isFinite(t) ? t : 0;
                 u.time.value = finiteT;
+                u.cloudDisplacement.value.copy(cloudMotion.update(finiteT,u.skyWind.value));
                 if (sys._cloudTransition) {
                     const transition = sys._cloudTransition;
                     if (transition.t0 === null) transition.t0 = finiteT;
@@ -2915,14 +2913,30 @@ import * as TSL from 'three/tsl';
             dispose() {
                 if (disposed) return;
                 disposed = true;
+                if (globalThis._autoEnhanceCloudReflectHook === sys._reflectionHook) {
+                    globalThis._autoEnhanceCloudReflectHook = null;
+                }
+                if (sys._reflectionBlurHook
+                    && globalThis._autoEnhanceCloudReflectBlurHook === sys._reflectionBlurHook) {
+                    globalThis._autoEnhanceCloudReflectBlurHook = null;
+                }
+                sys._reflectionHook = null;
+                sys._reflectionBlurHook = null;
+                if (sys._envFbNode) sys._envFbNode.value = null;
+                sys._envFbNode = null;
+                sys._envFbPlaceholder?.dispose?.();
+                sys._envFbPlaceholder = null;
                 sys._cloudTransition = null;
                 cloudTransitionInfo.active = false;
                 for (const [material, roots] of cloudShadowRoots) {
-                    if (material.colorNode !== roots.wrapped) continue;
-                    material.colorNode = roots.original ?? null;
+                    if (material.setupLightingModel !== roots.wrapped) continue;
+                    if (roots.original === undefined) delete material.setupLightingModel;
+                    else material.setupLightingModel = roots.original;
                     material.needsUpdate = true;
                 }
                 cloudShadowRoots.clear();
+                sys._solarOcclusion = null;
+                cloudShadowMap.dispose();
                 scene.remove(bgDome, cloudDome);
                 cloudDome.geometry.dispose();
                 bgDome.geometry.dispose();
@@ -2930,6 +2944,7 @@ import * as TSL from 'three/tsl';
                 bgMat.dispose();
                 noiseTex.dispose();
                 weatherTex.dispose();
+                if (ownsCirrusTexture) cirrusTex.dispose();
                 lightCacheTex?.dispose?.();
                 lightCacheCompute?.dispose?.();
                 sys._envTarget?.dispose?.();
@@ -2939,6 +2954,16 @@ import * as TSL from 'three/tsl';
                 sys._envRingworld = null;
             },
         };
+        cloudShadowMap = makeCloudShadowMap(T3, {
+            transmittance: p => sys.tslCloudTransmittance(p),
+            lightDirection: u.cloudLightDir, time: u.time, displacement: u.cloudDisplacement,
+            resolution: opts.cloudShadowResolution ?? 384,
+            extent: opts.cloudShadowExtent ?? 6144,
+            verticalSpan: opts.cloudShadowVerticalSpan ?? 1024,
+            refreshSeconds: opts.cloudShadowRefreshSeconds ?? .1,
+        });
+        sys.cloudShadowInfo.map = cloudShadowMap.stats;
+        sys.cloudShadowMap = cloudShadowMap;
         sys.setClouds(opts.clouds ?? 'cumulus');
         sys.setTime(opts.hours ?? 12);
         return sys;

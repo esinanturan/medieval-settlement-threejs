@@ -59,6 +59,12 @@ export class OpenSkyFallback extends THREE.Mesh<THREE.SphereGeometry, THREE.Shad
         void main() {
           vSkyDirection = normalize(position);
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          // Keep the legacy sky behind the entire visible terrain horizon.
+          #ifdef USE_REVERSED_DEPTH_BUFFER
+            gl_Position.z = 0.0;
+          #else
+            gl_Position.z = gl_Position.w;
+          #endif
         }
       `,
       fragmentShader: `

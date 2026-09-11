@@ -1,0 +1,211 @@
+diff --git a/engine/sky_system.js b/engine/sky_system.js
+index 3a7bf5d0..5c69a824 100644
+--- a/engine/sky_system.js
++++ b/engine/sky_system.js
+@@ -1,5 +1,12 @@
+ // sky_system.js — WORLD-SPACE volumetric sky for eidoverse.
+ //
++// Vendored by medieval-road-system as an ES module. The rendering code remains
++// Eanpa Sky v0.2.1; the small integration patch below supplies the game's
++// historical latitude/sidereal star orientation and constellation overlay.
++
++import * as THREE_WEBGPU from 'three/webgpu';
++import * as TSL from 'three/tsl';
++//
+ // Replaces the old screenspace cloud pipeline's weak spots:
+ //   · clouds live on a camera-centered DOME rendered in the scene pass —
+ //     depth-tests against geometry natively (no depth-keying), rays are
+@@ -25,8 +32,7 @@ import { makeCloudShadowMap } from './cloud_shadow_map.js';
+ import { createCloudMotion } from './cloud_motion.js';
+ import { makeAnalyticSkyNoise } from './sky_noise.js';
+ 
+-(function () {
+-    const T3 = globalThis.THREE;
++    const T3 = { ...THREE_WEBGPU, ...TSL };
+     const {
+         uniform, Fn, vec2, vec3, vec4, float, Loop, Break, If,
+         sin, cos, fract, floor, mix, clamp, smoothstep, step, dot, length,
+@@ -133,7 +139,7 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+             wispOn: 0.0, wispScale: 0.001, wispThreshold: 1.0, wispStrength: 0.0, wispOpacity: 0.0, wispFloor: 0.0, wispStretch: [1, 1, 1], wispFilament: 0.0, wispTint: [1, 1, 1] },
+     };
+ 
+-    globalThis.makeSkySystem = async function makeSkySystem({ scene, textures = {}, opts = {} } = {}) {
++    export async function makeSkySystem({ scene, textures = {}, opts = {} } = {}) {
+         const R_EARTH = opts.earthRadius ?? 6371000;
+         const DOME_R = opts.domeRadius ?? 3200;
+         const N_MARCH = opts.skySamples ?? 60;
+@@ -183,6 +189,9 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+             sunGlowI: uniform(1),      // forward-scatter glow lobes gate — scenes with a custom celestial body AS the sun zero this (the disc obeys sunDiscI; these lobes previously bled a bright white core through any body riding sunDir)
+             frameJit: uniform(0),      // EANPA: per-frame golden-ratio phase for temporal blue-noise jitter (fed by the cloud frame graph)
+             starFade: uniform(0),
++            siderealAngle: uniform(opts.siderealAngle ?? 0),
++            observerLatitude: uniform((opts.observerLatitudeDeg ?? 45.6) * Math.PI / 180),
++            constellationVisibility: uniform(opts.constellationVisibility ?? 0),
+             // additive night skyglow (light pollution): a scene with a glowing
+             // shield/city lifts the sky background and drowns faint stars.
+             // Default black = zero change anywhere it isn't driven.
+@@ -1633,7 +1642,11 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+         // keep sky surfaces OUT of the auto-enhance G-buffer (GTAO/SSR must not
+         // treat dome normals as scene geometry)
+         const noGBuffer = (m) => {
+-            if (T3.mrt && T3.vec4 && !globalThis.EANPA_NO_MRT) m.mrtNode = T3.mrt({ normal: T3.vec4(0), metalrough: T3.vec4(0) });   // EANPA: forward path — mrt stamps compile to empty structs in Chrome
++            // The medieval-road-system post stack uses an ordinary forward
++            // scene pass. Eanpa's optional r184 MRT stamp compiles to an empty
++            // output struct under Three r185, which WebGPU correctly rejects.
++            // Leaving mrtNode unset both excludes the sky from that path and
++            // preserves a valid forward-only material.
+             return m;
+         };
+         // cloudBody already returns premultiplied RGB. NodeMaterial's
+@@ -1662,6 +1675,12 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+ 
+         // ---------------- BACKGROUND + CELESTIAL dome ----------------
+         const starsNode = textures.stars ? T3.texture(textures.stars) : null;
++        const starBackdropNode = textures.starBackdrop ? T3.texture(textures.starBackdrop) : null;
++        const starBackdropTransform = Array.isArray(opts.starBackdropTransform)
++            && opts.starBackdropTransform.length === 9
++            && opts.starBackdropTransform.every(Number.isFinite)
++            ? opts.starBackdropTransform
++            : [1, 0, 0, 0, 1, 0, 0, 0, 1];
+         const moonNode = textures.moon ? T3.texture(textures.moon) : null;
+         const hdriNode = textures.hdri ? T3.texture(textures.hdri) : null;
+         const equirectUV = (d) => vec2(
+@@ -1688,17 +1707,82 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+                 const cosA = dot(dir, u.moonDir);
+                 moonDisc = smoothstep(u.moonCos, u.moonCos.add(0.0004), cosA);
+             }
+-            // stars (rotated slowly, faded by sun elevation, occluded by the moon)
+-            if (starsNode) {
+-                const ra = u.time.mul(0.004);
+-                const dR = vec3(
+-                    dir.x.mul(cos(ra)).sub(dir.z.mul(sin(ra))),
+-                    dir.y,
+-                    dir.x.mul(sin(ra)).add(dir.z.mul(cos(ra))),
+-                );
+-                const st = starsNode.sample(equirectUV(dR)).level(0).rgb;   // EANPA: explicit LOD
+-                let starTerm = st.mul(st).mul(u.starFade).mul(1.6);   // st² boosts contrast
+-                if (moonDisc) starTerm = starTerm.mul(float(1).sub(moonDisc));
++            // Historical naked-eye catalogue. Convert the local horizon ray
++            // (+X east, +Z north, +Y up) into equatorial coordinates for the
++            // observer latitude, then rotate it by local sidereal time. This
++            // keeps the 1550 catalogue aligned to Gorski Kotar throughout the
++            // night and gives each month its correct evening constellations.
++            if (starsNode || starBackdropNode) {
++                const sinLatitude = sin(u.observerLatitude);
++                const cosLatitude = cos(u.observerLatitude);
++                const sinSidereal = sin(u.siderealAngle);
++                const cosSidereal = cos(u.siderealAngle);
++                const meridian = cosLatitude.mul(dir.y).sub(sinLatitude.mul(dir.z));
++                const celestialNorth = sinLatitude.mul(dir.y).add(cosLatitude.mul(dir.z));
++                const equatorialDirection = normalize(vec3(
++                    meridian.mul(cosSidereal).sub(dir.x.mul(sinSidereal)),
++                    celestialNorth,
++                    meridian.mul(sinSidereal).add(dir.x.mul(cosSidereal)),
++                ));
++                const horizonVisibility = smoothstep(0.035, 0.18, dir.y);
++                const starTerm = vec3(0).toVar();
++                if (starBackdropNode) {
++                    // Eanpa's 4K Tycho panorama is a J2000 atlas. Rotate the
++                    // epoch-1550 ray back to J2000 before sampling. The atlas
++                    // puts RA=0 on its half-turn seam and increases RA toward
++                    // decreasing U; that handedness was verified against the
++                    // game's bright-star catalogue rather than assumed.
++                    const j2000Direction = normalize(vec3(
++                        equatorialDirection.x.mul(starBackdropTransform[0])
++                            .add(equatorialDirection.y.mul(starBackdropTransform[1]))
++                            .add(equatorialDirection.z.mul(starBackdropTransform[2])),
++                        equatorialDirection.x.mul(starBackdropTransform[3])
++                            .add(equatorialDirection.y.mul(starBackdropTransform[4]))
++                            .add(equatorialDirection.z.mul(starBackdropTransform[5])),
++                        equatorialDirection.x.mul(starBackdropTransform[6])
++                            .add(equatorialDirection.y.mul(starBackdropTransform[7]))
++                            .add(equatorialDirection.z.mul(starBackdropTransform[8])),
++                    ));
++                    const backdropUv = vec2(
++                        fract(float(0.5).sub(
++                            atan2f(j2000Direction.z, j2000Direction.x)
++                                .div(Math.PI * 2),
++                        )),
++                        float(0.5).sub(asin(clamp(j2000Direction.y, -1, 1)).div(Math.PI)),
++                    );
++                    const backdrop = starBackdropNode.sample(backdropUv).level(0).rgb;
++                    // Preserve Eanpa's contrast-squared response: its dense
++                    // Milky Way stays dark and detailed while star cores remain
++                    // pin-sharp instead of becoming a grey veil.
++                    starTerm.assign(backdrop.mul(backdrop).mul(1.6));
++                }
++                if (starsNode) {
++                    const starUv = vec2(
++                        fract(atan2f(equatorialDirection.z, equatorialDirection.x)
++                            .div(Math.PI * 2).add(1)),
++                        float(0.5).sub(asin(clamp(equatorialDirection.y, -1, 1)).div(Math.PI)),
++                    );
++                    const st = starsNode.sample(starUv).level(0);   // EANPA: explicit LOD
++                    const twinkle = sin(
++                        u.time.mul(0.07)
++                            .add(dot(floor(starUv.mul(1024)), vec2(0.067, 0.113))),
++                    ).mul(0.03).add(0.97);
++                    const historicalStars = st.rgb.mul(st.rgb).mul(twinkle).mul(1.48);
++                    // The catalogue supplies authoritative bright-star color
++                    // and magnitude; max avoids double-brightening stars that
++                    // are also present in the Tycho panorama.
++                    starTerm.assign(max(starTerm, historicalStars));
++                    col.addAssign(
++                        vec3(0.31, 0.45, 0.67)
++                            .mul(st.a)
++                            .mul(u.starFade)
++                            .mul(horizonVisibility)
++                            .mul(u.constellationVisibility)
++                            .mul(1.55),
++                    );
++                }
++                starTerm.mulAssign(u.starFade.mul(horizonVisibility));
++                if (moonDisc) starTerm.mulAssign(float(1).sub(moonDisc));
+                 col.addAssign(starTerm);
+                 col.addAssign(vec3(u.skyGlow));                        // pollution veil over the stars
+             }
+@@ -1990,6 +2074,19 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+                 };
+                 return true;
+             },
++            setSiderealAngle(angle) {
++                u.siderealAngle.value = Number.isFinite(angle) ? angle : 0;
++            },
++            setConstellationVisibility(visibility) {
++                u.constellationVisibility.value = Math.max(0, Math.min(1, visibility ?? 0));
++            },
++            setSunDirection(direction) {
++                if (!direction) return;
++                const normalizedDirection = direction.clone().normalize();
++                const azimuth = Math.atan2(normalizedDirection.z, normalizedDirection.x);
++                const elevation = Math.asin(Math.max(-1, Math.min(1, normalizedDirection.y)));
++                sys.setSun(azimuth, elevation);
++            },
+             setSun(azRad, elRad) {
+                 sys.sunDir.set(Math.cos(elRad) * Math.cos(azRad), Math.sin(elRad), Math.cos(elRad) * Math.sin(azRad)).normalize();
+                 u.sunDir.value.copy(sys.sunDir);
+@@ -2026,10 +2123,14 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+                 updateWispColor();
+             },
+             setMoonDirection(direction) {
++                if (!direction) return;
+                 sys.moonDir.copy(direction).normalize();
+                 u.moonDir.value.copy(sys.moonDir);
+-                u.moonRight.value.set(0, 1, 0).cross(sys.moonDir).normalize();
+-                u.moonUp.value.copy(sys.moonDir).cross(u.moonRight.value).normalize();
++                const mr = V(0, 1, 0).cross(sys.moonDir);
++                if (mr.lengthSq() < 1e-8) mr.set(1, 0, 0);
++                mr.normalize();
++                u.moonRight.value.copy(mr);
++                u.moonUp.value.copy(sys.moonDir.clone().cross(mr).normalize());
+                 updateCloudKey();
+             },
+             setTime(hours) {
+@@ -2866,6 +2967,4 @@ import { makeAnalyticSkyNoise } from './sky_noise.js';
+         sys.setClouds(opts.clouds ?? 'cumulus');
+         sys.setTime(opts.hours ?? 12);
+         return sys;
+-    };
+-    console.log('[sky_system] makeSkySystem ready — world-space cloud dome + celestial layer (sun disc, NASA moon w/ phases, Tycho stars), TOD palette, cloud presets');
+-})();
++    }

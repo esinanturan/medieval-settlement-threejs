@@ -11,7 +11,7 @@ import {
   GORSKI_KOTAR_LATITUDE_DEG,
 } from './gorskiKotarCelestial.ts';
 import type { OpenSkyFallback } from './OpenSkyFallback.ts';
-import { SKY_DEPTH_OCCLUSION_RADIUS } from './skyDepthOcclusionPolicy.ts';
+import { SKY_DOME_RADIUS } from './skyDepthOcclusionPolicy.ts';
 
 type SkyCloudOptions = {
   cloudAbsorption?: number;
@@ -61,7 +61,7 @@ const DEFAULTS = {
   constellationVisibility: 0,
   maxCloudDistance: 6200,
   observerLatitudeDeg: GORSKI_KOTAR_LATITUDE_DEG,
-  radius: SKY_DEPTH_OCCLUSION_RADIUS,
+  radius: SKY_DOME_RADIUS,
   siderealAngle: 0,
   sunDirection: new THREE.Vector3(0.5, 0.5, -0.5).normalize(),
 };
@@ -286,8 +286,9 @@ export class SkyCloudMesh extends THREE.Group {
         console.warn('Eanpa moon texture could not be loaded; continuing without the moon disc.', error);
         return undefined;
       });
-    const [{ makeSkySystem }, moonTexture, starBackdrop] = await Promise.all([
+    const [{ makeSkySystem }, { skyDomeVertex }, moonTexture, starBackdrop] = await Promise.all([
       enginePromise,
+      import('./skyDomeDepth.ts'),
       moonTexturePromise,
       starBackdropPromise,
     ]);
@@ -331,6 +332,10 @@ export class SkyCloudMesh extends THREE.Group {
     this.starBackdrop = starBackdrop ?? null;
     this.eanpa = system;
     for (const [index, dome] of system.domes.entries()) {
+      // Three's bundled NodeMaterial declarations omit its vertexNode hook.
+      (dome as THREE.Mesh<THREE.BufferGeometry, THREE.Material & {
+        vertexNode: typeof skyDomeVertex;
+      }>).material.vertexNode = skyDomeVertex;
       dome.name = index === 0
         ? 'Eanpa atmospheric and historical celestial dome'
         : 'Eanpa volumetric cloud dome';

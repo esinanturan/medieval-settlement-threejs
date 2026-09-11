@@ -18,6 +18,7 @@ export function makeSkySystem(options?: {
     starBackdrop?: Texture;
     moon?: Texture;
     hdri?: Texture;
+    cirrus?: Texture;
   };
   opts?: Record<string, unknown>;
 }): Promise<EanpaSkySystem>;

@@ -61,7 +61,8 @@ import type { Point2 } from '../utils/polygonGeometry.ts';
 import type { BridgeSamplingContext } from '../roads/RiverBridgeSpans.ts';
 import { getStillWaterSurfaceY } from '../rivers/RiverWaterLevel.ts';
 import { SkyCloudMesh } from '../sky/SkyCloudMesh.ts';
-import { SKY_DEPTH_OCCLUSION_RADIUS } from '../sky/skyDepthOcclusionPolicy.ts';
+import { computeWorldCameraFarPlane, SKY_DOME_RADIUS } from '../sky/skyDepthOcclusionPolicy.ts';
+import { LIVE_WORLD_MAX_DISTANCE } from '../camera/CameraCurves.ts';
 import {
   FAIR_DAY_FOG_COLOR,
   type DayNightGrade,
@@ -394,7 +395,11 @@ export class SceneManager {
     }
     // A slightly longer lens keeps the broad settlement readable while making
     // the layered Dinaric landscape feel less miniaturised.
-    this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 2600);
+    this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, computeWorldCameraFarPlane({
+      terrainSize: terrain.size,
+      playableSize: terrain.playableSize,
+      maxOrbitDistance: LIVE_WORLD_MAX_DISTANCE,
+    }));
     this.camera.layers.disable(TREE_SHADOW_CAST_LAYER);
     this.sunDirection.setFromSphericalCoords(1, THREE.MathUtils.degToRad(43), THREE.MathUtils.degToRad(225));
     this.shadowKeyDirection.copy(this.sunDirection);
@@ -423,7 +428,7 @@ export class SceneManager {
       maxCloudDistance: 6200,
       mieCoefficient: 0.0032,
       mieDirectionalG: 0.6,
-      radius: SKY_DEPTH_OCCLUSION_RADIUS,
+      radius: SKY_DOME_RADIUS,
       rayleigh: 0.7,
       turbidity: 1.45,
       windSpeedX: 0.085,

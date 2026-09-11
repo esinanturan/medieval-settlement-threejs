@@ -4,6 +4,7 @@ import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { build as buildVite } from 'vite';
 import { shouldCopyPublicPath } from './productionPublicAssets.ts';
+import { testSceneManagerStartupContract } from './fixtures/testSceneManagerStartupContract.mts';
 
 const bootstrapPath = 'src/app/appBootstrap.ts';
 const appPath = 'src/app/App.ts';
@@ -270,12 +271,7 @@ for (const forbiddenPostPlayWork of [
     `first-playable startup must not launch post-play work: ${forbiddenPostPlayWork}`,
   );
 }
-assert.ok(
-  sceneManager.includes('(this.renderer as StartupPrecompilableRenderer).initTexture(texture);')
-    && sceneManager.includes('await renderer.compileAsync(object, this.camera, this.scene);')
-    && sceneManager.includes('return this.waitForSubmittedWork();'),
-  'startup residency must include texture upload, targeted live-scene shader compilation, and GPU completion',
-);
+await testSceneManagerStartupContract();
 assert.equal(
   app.match(/waitForFirstPlayableGpuWork\(\)/g)?.length,
   2,
@@ -285,11 +281,6 @@ assert.equal(
   app.includes('waitForStartupStage('),
   false,
   'non-cancellable GPU startup work must not outlive a timeout and collide with gameplay',
-);
-assert.equal(
-  sceneManager.includes('renderer.compileAsync(this.scene, this.camera)'),
-  false,
-  'first-playable compilation must not traverse the complete terrain/woodland scene',
 );
 assert.ok(
   buildingMaterials.includes('initializeBuildingMaterialAtlas(maxAnisotropy, preloadTexture)')
