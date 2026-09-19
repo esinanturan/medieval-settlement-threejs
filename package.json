@@ -374,6 +374,7 @@
     "vite": "^8.1.4"
   },
   "dependencies": {
+    "lil-gui": "^0.21.0",
     "spacetimedb": "2.0.1",
     "three": "^0.185.1"
   }
